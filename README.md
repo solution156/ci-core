@@ -1,48 +1,90 @@
-# KubeWorkspace — CI Core (candidate v2.1.0)
+# CI Core
 
-Thư viện GitLab templates và scripts cho repo Workspace Images. CI Core không tự build application image khi push core.
+Repository chứa template, script, và logic cốt lõi cho pipeline GitLab.
 
-**Runbook chính:** [docs/PIPELINE_GUIDE_VI.md](docs/PIPELINE_GUIDE_VI.md).
+## Cấu trúc repo
 
-## Files
+- `scripts/` — utilities (pipeline.py, catalog.py, plan.py, harbor.py, release.py, job.py)
+- `templates/` — GitLab CI templates (workspace-parent.yaml, workspace-child.yaml, common.yaml)
+- `tests/` — unit/contract/local integration tests
+- `docs/` — pipeline runbook docs
 
-- `templates/common.yaml`: tool defaults, clone đúng core ref bằng CI_JOB_TOKEN.
-- `templates/workspace-parent.yaml`: validation → planner → native dynamic-child trigger.
-- `templates/workspace-child.yaml`: build/scan/patch/verify/SBOM/evidence/sign/promote/release/cleanup templates.
-- Hai file `workspace-*.gitlab-ci.yml` cũ chỉ là wrapper compatibility.
-- `scripts/catalog.py`: metadata và event/selection policy.
-- `scripts/plan.py`: sinh child YAML (JSON subset), không cần YAML library trong job runtime.
-- `scripts/pipeline.py`, `harbor.py`, `release.py`, `job.py`: runtime và job-scoped credentials.
-- `tests/`: regression tests, artifact/DAG/security contracts và opt-in real local integration.
+## Giới thiệu template
 
-## Flow
+### workspace-parent.yaml
+- Parent validates source
+- Creates dynamic child pipeline
+- Stages: validate, plan, build, scan, sign, promote, cleanup
 
-- Development/MR FAST: diff-selective build + runtime smoke, không push/sign/promote.
-- Protected main FULL: mặc định **tất cả enabled images**; manual web selection có kiểm soát.
-- Protected `release/<image>/vX.Y.Z` branch: một image, `rc-X.Y.Z`.
-- Protected `<image>/vX.Y.Z` hoặc `release/<image>/vX.Y.Z` Git tag: một image, immutable `X.Y.Z` và GitLab Release.
-- VS Code có CI bootstrap resolve lockfile thật; không bắt cài extension trên host, không bịa version. Normal builds vẫn require valid lock.
+### workspace-child.yaml
+- Per-image templates
+- Stages: prepare, build, scan, patch, verify, sbom, evidence, sign, devguard, promote, release, cleanup
 
-## Test local
+## Trạm chạy (Runner) yêu cầu
 
-```bash
-cd /root/kubeworkspace/ci-core
-/usr/bin/python3 -m unittest discover -s tests -v
-/usr/bin/python3 -m compileall -q scripts tests
-/usr/bin/python3 tests/local_integration.py          # plan only
-/usr/bin/python3 tests/local_integration.py --run    # real Docker fixture, local registry, Trivy, Cosign
-```
+- Python 3.12+
+- Docker
+- git
+- Trivy, Cosign (có thể cài qua image build)
 
-Python cần PyYAML cho tests. Trên CI dùng `tests/requirements.txt`; môi trường hạn chế mạng nên mirror dependency hoặc dùng test image đã có sẵn. Runtime planner chỉ dùng standard library.
+## Liên kết pipeline
 
-Integration fixture không chứng minh GitLab/Harbor production. Kết quả thực ở `reports/local-integration/result.json`; report/evidence không commit.
+Project `workspace-images` sẽ `include` file từ project `https://gitlab.com/hermes156/ci-core`,
+file chính: `/templates/workspace-parent.yaml`
+- `CI_CORE_PROJECT` = `hermes156/ci-core`
+- `CI_CORE_REF`   = `v2.1.0`
 
-## Rollout
+## CI Pipeline (from workspace-images)
 
-1. Review/publish core và tạo **tag mới `v2.1.0`**; không force đổi `v2.0.0`.
-2. Consumer include `/templates/workspace-parent.yaml` và clone `CI_CORE_REF` cùng tag.
-3. Job-token allowlist, protected refs, pull-only vs push credentials, CA/proxy/DinD isolation phải cấu hình trên hạ tầng thật.
-4. GitLab >=18.2 dùng `strategy: mirror`; bản cũ cần kiểm tra và đổi `depend`.
-5. CI Lint thật + FAST trước FULL/RELEASE. Không cấp production signing/push secrets cho untrusted branch/MR.
+### validate
+- Python compile + unit tests
+- Bash syntax check
+- Trivy secret/misconfig scan
 
-Không cần cài GitLab server để chạy tests local. Không mở daemon DinD không TLS ra host/public network. Không prune shared daemon.
+### plan
+- Generate child pipeline YAML
+- Create plan artifacts
+
+### build
+- Docker build for each image in images.json
+- Push to Harbor registry
+
+### scan
+- Trivy vulnerability scan
+- Report artifacts
+
+### patch
+- Harbor snapshot
+- Verify patch results
+
+### verify
+- Runtime checks
+- Trivy gate (HIGH,CRITICAL)
+
+### sbom
+- CycloneDX SBOM generation
+
+### evidence
+- Release evidence bundle
+
+### sign
+- Cosign signing of image tags
+- Generation of attestation and provenance
+
+### promote
+- Promote image to production tag in Harbor
+
+### release
+- Publish final image and manifest
+
+### cleanup
+- Clean up job-local files (not registry)
+
+## Build & Trigger
+
+Các image sẽ được build và push lên Harbor registry theo `images.json`.
+Pipeline cần các biến môi trường sau (đặt ở GitLab CI/CD settings):
+- `HARBOR_REGISTRY`: registry host (vd: `rd-harbor-secops.servicemicro.net`)
+- `HARBOR_PROJECT`: project trong Harbor (vd: `kubeworkspace`)
+- `HARBOR_USER`, `HARBOR_PASSWORD`: credential cho Harbor
+- `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`: bằng chứng digital signing
