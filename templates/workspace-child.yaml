@@ -1,0 +1,236 @@
+# Per-image templates. Generated child selects jobs; no production jobs in FAST.
+include:
+  - local: /templates/common.yaml
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline"'
+    - when: never
+stages: [prepare, build, scan, patch, verify, sbom, evidence, sign, devguard, promote, release, cleanup]
+
+ci:tools:
+  extends: .tools
+  stage: prepare
+  needs: []
+
+.workspace-docker:
+  image: $DOCKER_CLI_IMAGE
+  resource_group: $HEAVY_RESOURCE_GROUP
+  services:
+    - name: $DIND_IMAGE
+      alias: docker
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_BUILDKIT: "1"
+    DOCKER_DRIVER: "overlay2"
+    DOCKER_CONFIG: "$CI_PROJECT_DIR/.docker-job"
+  before_script:
+    # Use a combined internal image to avoid apk in air-gapped deployments.
+    - command -v python3 >/dev/null && command -v bash >/dev/null && command -v git >/dev/null || apk add --no-cache python3 bash git
+    - python3 .ci-tools/scripts/job.py docker-auth
+    - docker info >/dev/null
+  after_script:
+    # Only credentials created for this job; never prune a shared daemon.
+    - python3 .ci-tools/scripts/job.py cleanup-auth
+  timeout: 8h
+
+.workspace-smoke:
+  extends: .workspace-docker
+  stage: build
+  interruptible: true
+  script:
+    - python3 .ci-tools/scripts/pipeline.py smoke
+  artifacts:
+    when: always
+    expire_in: 2 days
+    paths: ['out/$IMAGE_ID/']
+
+.workspace-lock:
+  extends: .workspace-docker
+  stage: build
+  interruptible: true
+  script:
+    - python3 .ci-tools/scripts/pipeline.py lock
+  artifacts:
+    expire_in: 7 days
+    paths: ['out/$IMAGE_ID/extensions.lock']
+
+.workspace-build:
+  extends: .workspace-docker
+  stage: build
+  script:
+    - python3 .ci-tools/scripts/pipeline.py build
+  artifacts:
+    expire_in: 7 days
+    paths: ['out/$IMAGE_ID/build.json', 'out/$IMAGE_ID/built.txt']
+
+.workspace-scan:
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  stage: scan
+  variables:
+    TRIVY_USERNAME: $HARBOR_USER
+    TRIVY_PASSWORD: $HARBOR_PASSWORD
+  script:
+    - |
+      set -eu
+      ref="$(cat "out/$IMAGE_ID/built.txt")"
+      # This report drives patching. The mandatory gate runs on the final digest.
+      trivy image --scanners vuln --severity "$TRIVY_SCAN_SEVERITY" --format json \
+        --output "out/$IMAGE_ID/scan.json" "$ref"
+      test -s "out/$IMAGE_ID/scan.json"
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths: ['out/$IMAGE_ID/scan.json']
+
+.workspace-patch:
+  extends: .workspace-docker
+  stage: patch
+  script:
+    - python3 .ci-tools/scripts/pipeline.py patch
+    - python3 .ci-tools/scripts/harbor.py snapshot
+  artifacts:
+    expire_in: 7 days
+    paths: ['out/$IMAGE_ID/patch.json', 'out/$IMAGE_ID/verified.txt']
+
+.workspace-verify-trivy:
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  stage: verify
+  variables:
+    TRIVY_USERNAME: $HARBOR_USER
+    TRIVY_PASSWORD: $HARBOR_PASSWORD
+  script:
+    - |
+      set -eu
+      ref="$(cat "out/$IMAGE_ID/verified.txt")"
+      trivy image --scanners vuln --severity "$TRIVY_GATE_SEVERITY" --exit-code 1 \
+        --format json --output "out/$IMAGE_ID/verify.json" "$ref"
+      test -s "out/$IMAGE_ID/verify.json"
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths: ['out/$IMAGE_ID/verify.json']
+
+.workspace-verify-runtime:
+  extends: .workspace-docker
+  stage: verify
+  script:
+    - python3 .ci-tools/scripts/pipeline.py runtime
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths: ['out/$IMAGE_ID/runtime.json']
+
+.workspace-sbom:
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  stage: sbom
+  variables:
+    TRIVY_USERNAME: $HARBOR_USER
+    TRIVY_PASSWORD: $HARBOR_PASSWORD
+  script:
+    - |
+      set -eu
+      ref="$(cat "out/$IMAGE_ID/verified.txt")"
+      trivy image --format cyclonedx --output "out/$IMAGE_ID/sbom.cdx.json" "$ref"
+      test -s "out/$IMAGE_ID/sbom.cdx.json"
+  artifacts:
+    expire_in: 7 days
+    paths: ['out/$IMAGE_ID/sbom.cdx.json']
+
+.workspace-evidence:
+  image: $PYTHON_IMAGE
+  stage: evidence
+  script:
+    - python3 .ci-tools/scripts/release.py evidence
+  artifacts:
+    expire_in: 30 days
+    # Deliberate evidence bundle for sign/promote: direct dependency, not implicit dotenv.
+    paths: ['out/$IMAGE_ID/']
+
+.workspace-sign:
+  image:
+    name: $COSIGN_IMAGE
+    entrypoint: [""]
+  stage: sign
+  variables:
+    DOCKER_CONFIG: "$CI_PROJECT_DIR/.docker-job"
+  script:
+    - |
+      set -eu
+      test "$CI_COMMIT_REF_PROTECTED" = true
+      : "${COSIGN_PRIVATE_KEY:?Missing protected COSIGN_PRIVATE_KEY}"
+      : "${COSIGN_PASSWORD:?Missing protected COSIGN_PASSWORD}"
+      : "${HARBOR_USER:?Missing protected HARBOR_USER}"
+      : "${HARBOR_PASSWORD:?Missing protected HARBOR_PASSWORD}"
+      umask 077
+      mkdir -p "$DOCKER_CONFIG"
+      trap 'rm -f "$DOCKER_CONFIG/config.json"; rmdir "$DOCKER_CONFIG" 2>/dev/null || true' EXIT
+      if [ -n "${DOCKER_AUTH_CONFIG:-}" ]; then
+        printf '%s' "$DOCKER_AUTH_CONFIG" > "$DOCKER_CONFIG/config.json"
+      else
+        encoded="$(printf '%s:%s' "$HARBOR_USER" "$HARBOR_PASSWORD" | base64 | tr -d '\n')"
+        printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$HARBOR_REGISTRY" "$encoded" > "$DOCKER_CONFIG/config.json"
+        unset encoded
+      fi
+      if [ -f "$COSIGN_PRIVATE_KEY" ]; then key="$COSIGN_PRIVATE_KEY"; else key=env://COSIGN_PRIVATE_KEY; fi
+      ref="$(cat "out/$IMAGE_ID/verified.txt")"
+      cosign sign --yes --key "$key" --tlog-upload=false "$ref"
+      cosign attest --yes --key "$key" --tlog-upload=false --type cyclonedx --predicate "out/$IMAGE_ID/sbom.cdx.json" "$ref"
+      cosign attest --yes --key "$key" --tlog-upload=false --type slsaprovenance1 --predicate "out/$IMAGE_ID/provenance.json" "$ref"
+      if [ -f "out/$IMAGE_ID/vex.openvex.json" ]; then
+        cosign attest --yes --key "$key" --tlog-upload=false --type openvex --predicate "out/$IMAGE_ID/vex.openvex.json" "$ref"
+      fi
+      printf '%s\n' "$ref" > "out/$IMAGE_ID/signed.txt"
+  artifacts:
+    expire_in: 30 days
+    paths: ['out/$IMAGE_ID/']
+
+.workspace-devguard:
+  image:
+    name: $DEVGUARD_SCANNER_IMAGE
+    entrypoint: [""]
+  stage: devguard
+  script:
+    - |
+      set -eu
+      : "${DEVGUARD_TOKEN:?Missing DEVGUARD_TOKEN}"
+      : "${DEVGUARD_ASSET_NAME:?Missing DEVGUARD_ASSET_NAME}"
+      : "${DEVGUARD_API_URL:?Missing DEVGUARD_API_URL}"
+      : "${DEVGUARD_WEB_UI:?Missing DEVGUARD_WEB_UI}"
+      devguard-scanner sbom "out/$IMAGE_ID/sbom.cdx.json" --assetName "$DEVGUARD_ASSET_NAME" \
+        --apiUrl "$DEVGUARD_API_URL" --webUI "$DEVGUARD_WEB_UI" --artifactName "$(cat "out/$IMAGE_ID/verified.txt")"
+
+.workspace-promote:
+  image: $PYTHON_IMAGE
+  stage: promote
+  interruptible: false
+  script:
+    - python3 .ci-tools/scripts/harbor.py promote
+  artifacts:
+    expire_in: 30 days
+    paths: ['out/$IMAGE_ID/']
+
+.workspace-release:
+  image: $PYTHON_IMAGE
+  stage: release
+  script:
+    - python3 .ci-tools/scripts/release.py publish
+  artifacts:
+    expire_in: 30 days
+    paths: ['out/$IMAGE_ID/promotion.json', 'out/$IMAGE_ID/summary.md']
+
+.workspace-cleanup:
+  image: $SHELL_IMAGE
+  stage: cleanup
+  when: always
+  script:
+    # Artifacts remain under GitLab retention; no registry/cache deletion.
+    - 'test ! -f .docker-job/config.json || rm -f .docker-job/config.json'
+    - echo 'Job-local credential cleanup complete. DinD resources belong to their job.'

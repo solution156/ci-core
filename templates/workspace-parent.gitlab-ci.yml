@@ -1,0 +1,3 @@
+# Compatibility entry point; only one maintained parent implementation.
+include:
+  - local: /templates/workspace-parent.yaml

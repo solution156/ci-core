@@ -1,0 +1,214 @@
+"""Local regression tests. Git fixtures are real; no registry/network access."""
+import copy
+import importlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import yaml
+
+CORE = Path(__file__).resolve().parents[1]
+WORKSPACE = CORE.parent / 'workspace-images'
+sys.path.insert(0, str(CORE / 'scripts'))
+import catalog
+import plan
+
+
+class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='sdwf-tests-', dir=os.environ.get('TMPDIR'))
+        self.root = Path(self.tmp.name)
+        if WORKSPACE.is_dir():
+            shutil.copytree(WORKSPACE, self.root, dirs_exist_ok=True)
+        else:
+            # Standalone ci-core checkout: synthetic source fixture, not a claimed image build.
+            rows = []
+            for name in ('ubuntu', 'chrome', 'chrome-gpu', 'firefox', 'opera-browser', 'tor-browser', 'vscode'):
+                folder = self.root / 'images' / name
+                folder.mkdir(parents=True)
+                (folder / 'Dockerfile').write_text('FROM scratch\nUSER 1000\n')
+                deps = ['shared/browser/cleanup.sh'] if name in ('chrome', 'chrome-gpu', 'firefox', 'opera-browser') else []
+                rows.append({'id': name, 'repository': name, 'context': '.', 'dockerfile': f'images/{name}/Dockerfile',
+                             'platform': 'linux/amd64', 'enabled': name != 'vscode', 'version': '0.1.0', 'depends_on': deps})
+            config = self.root / 'images/vscode/configs'
+            config.mkdir()
+            (config / 'extensions.txt').write_text('fixture.extension\n')
+            (config / 'extensions.lock').write_text('# uninitialized fixture\n')
+            rows[-1]['extension_lock'] = {'manifest': 'images/vscode/configs/extensions.txt',
+                'lock': 'images/vscode/configs/extensions.lock', 'generated': '/opt/dwf-vscode/extensions.lock.generated'}
+            shared = self.root / 'shared/browser'
+            shared.mkdir(parents=True)
+            (shared / 'cleanup.sh').write_text('#!/bin/sh\ntrue\n')
+            (self.root / '.dockerignore').write_text('.docker-job\nout\n')
+            (self.root / 'images.json').write_text(json.dumps({'schema_version': 2, 'images': rows}))
+        self.cwd = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, self.cwd)
+        self.addCleanup(self.tmp.cleanup)
+        catalog.ROOT = self.root
+        self.addCleanup(setattr, catalog, 'ROOT', self.cwd)
+        self.env = patch.dict(os.environ, {
+            'PIPELINE_KIND': 'fast', 'CI_COMMIT_BRANCH': 'feature/chrome',
+            'CI_COMMIT_TAG': '', 'CI_PIPELINE_SOURCE': 'push',
+            'CI_COMMIT_REF_PROTECTED': 'false', 'CI_COMMIT_BEFORE_SHA': '',
+            'CI_MERGE_REQUEST_DIFF_BASE_SHA': '', 'IMAGE_SELECTION': 'auto',
+            'CI_PIPELINE_ID': '42', 'CI_COMMIT_SHA': 'a' * 40,
+            'CI_CORE_PROJECT': 'group/ci-core', 'CI_CORE_REF': 'v2.0.0',
+            'HARBOR_REGISTRY': 'registry.example.test', 'HARBOR_PROJECT': 'images',
+            'EXTENSION_BOOTSTRAP': '', 'ROOT_PIPELINE_ID': '42',
+        }, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.git('init', '-q')
+        self.git('config', 'user.email', 'test@example.test')
+        self.git('config', 'user.name', 'Local test')
+        self.commit()
+
+    def git(self, *args):
+        return subprocess.check_output(['git', *args], text=True, stderr=subprocess.DEVNULL).strip()
+
+    def commit(self):
+        self.git('add', '.')
+        self.git('commit', '-qm', 'fixture')
+        sha = self.git('rev-parse', 'HEAD')
+        os.environ['CI_COMMIT_SHA'] = sha
+        return sha
+
+    def full(self):
+        os.environ.update(PIPELINE_KIND='full', CI_COMMIT_BRANCH='main', CI_COMMIT_REF_PROTECTED='true')
+
+    def test_main_builds_all_enabled_even_without_diff(self):
+        self.full()
+        selected = catalog.plan()
+        self.assertEqual(len(selected['images']), 6)
+        self.assertEqual(selected['reason'], 'all-enabled-main')
+
+    def test_both_release_tag_patterns(self):
+        for tag in ('chrome/v0.1.0', 'release/chrome/v0.1.0'):
+            with self.subTest(tag=tag):
+                os.environ.update(PIPELINE_KIND='release', CI_COMMIT_BRANCH='', CI_COMMIT_TAG=tag,
+                                  CI_COMMIT_REF_PROTECTED='true')
+                selected = catalog.plan()
+                self.assertEqual([x['id'] for x in selected['images']], ['chrome'])
+                self.assertEqual(selected['images'][0]['final_tag'], '0.1.0')
+
+    def test_unprotected_full_rejected(self):
+        os.environ.update(PIPELINE_KIND='full', CI_COMMIT_BRANCH='main')
+        with self.assertRaises(SystemExit):
+            catalog.plan()
+
+    def test_release_version_mismatch_rejected(self):
+        os.environ.update(PIPELINE_KIND='release', CI_COMMIT_BRANCH='', CI_COMMIT_TAG='chrome/v0.2.0',
+                          CI_COMMIT_REF_PROTECTED='true')
+        with self.assertRaises(SystemExit):
+            catalog.plan()
+
+    def test_fast_only_changed_image(self):
+        before = self.git('rev-parse', 'HEAD')
+        with open('images/chrome/Dockerfile', 'a') as f:
+            f.write('\n# fixture change\n')
+        self.commit()
+        os.environ['CI_COMMIT_BEFORE_SHA'] = before
+        self.assertEqual([x['id'] for x in catalog.plan()['images']], ['chrome'])
+
+    def test_shared_change_selects_dependents(self):
+        before = self.git('rev-parse', 'HEAD')
+        with open('shared/browser/cleanup.sh', 'a') as f:
+            f.write('\n# fixture change\n')
+        self.commit()
+        os.environ['CI_COMMIT_BEFORE_SHA'] = before
+        ids = [x['id'] for x in catalog.plan()['images']]
+        self.assertEqual(set(ids), {'chrome', 'chrome-gpu', 'firefox', 'opera-browser'})
+
+    def test_mr_uses_mr_base(self):
+        before = self.git('rev-parse', 'HEAD')
+        with open('images/firefox/Dockerfile', 'a') as f:
+            f.write('\n# fixture change\n')
+        self.commit()
+        os.environ.update(CI_PIPELINE_SOURCE='merge_request_event', CI_COMMIT_BRANCH='',
+                          CI_MERGE_REQUEST_DIFF_BASE_SHA=before)
+        self.assertEqual([x['id'] for x in catalog.plan()['images']], ['firefox'])
+
+    def test_first_commit_no_changes_child_valid(self):
+        plan.generate('generated.yml')
+        data = yaml.safe_load(Path('generated.yml').read_text())
+        self.assertIn('images:no-changes', data)
+
+    def test_manual_selection_only_web(self):
+        os.environ['IMAGE_SELECTION'] = 'chrome'
+        with self.assertRaises(SystemExit):
+            catalog.plan()
+        os.environ['CI_PIPELINE_SOURCE'] = 'web'
+        self.assertEqual([x['id'] for x in catalog.plan()['images']], ['chrome'])
+
+    def test_generated_full_dag_no_missing_needs(self):
+        self.full()
+        plan.generate('generated.yml')
+        generated = yaml.safe_load(Path('generated.yml').read_text())
+        template = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
+        jobs = {k: v for k, v in generated.items() if isinstance(v, dict) and 'extends' in v}
+        self.assertIn('gen-sbom:chrome', jobs)
+        self.assertIn('cleanup:chrome', jobs)
+        for name, job in jobs.items():
+            self.assertIn(job['extends'], template, name)
+            for need in job['needs']:
+                self.assertIn(need['job'], set(jobs) | {'ci:tools'}, name)
+        for name in ('scan:chrome', 'sign:chrome', 'promote:chrome'):
+            self.assertTrue(jobs[name]['needs'])
+
+    def test_vscode_enabled_empty_lock_fails_clearly(self):
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'vscode')['enabled'] = True
+        Path('images.json').write_text(json.dumps(data))
+        with self.assertRaisesRegex(SystemExit, 'lock'):
+            catalog.catalog()
+
+    def test_vscode_malformed_nonempty_lock_rejected(self):
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'vscode')['enabled'] = True
+        Path('images.json').write_text(json.dumps(data))
+        Path('images/vscode/configs/extensions.lock').write_text('garbage\n')
+        with self.assertRaisesRegex(SystemExit, 'lock'):
+            catalog.catalog()
+
+    def test_explicit_bootstrap_allows_uninitialized_lock_only_for_bootstrap(self):
+        os.environ.update(EXTENSION_BOOTSTRAP='vscode', CI_PIPELINE_SOURCE='web')
+        result = catalog.plan()
+        self.assertEqual(result['mode'], 'bootstrap')
+        plan.generate('generated.yml')
+        data = yaml.safe_load(Path('generated.yml').read_text())
+        self.assertIn('lock:vscode', data)
+        self.assertFalse(any(k.startswith(('sign:', 'promote:')) for k in data))
+
+    def test_parent_trigger_is_native_gitlab_trigger(self):
+        data = yaml.safe_load((CORE / 'templates/workspace-parent.yaml').read_text())
+        trigger = data['pipeline:images']
+        self.assertNotIn('script', trigger)
+        self.assertNotIn('image', trigger)
+        self.assertEqual(trigger['trigger']['include'][0]['job'], 'prepare:plan')
+
+    def test_runtime_build_pins_digest_after_push(self):
+        import pipeline
+        args = type('Args', (), {'command': 'build', 'dry_run': False})()
+        self.full()
+        os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-p42-' + os.environ['CI_COMMIT_SHA'][:12])
+        calls = []
+        def fake_run(cmd, capture=False):
+            calls.append(cmd)
+            if capture:
+                return 'registry.example.test/images/chrome@sha256:' + 'b'*64
+            return ''
+        with patch.object(pipeline, 'run', fake_run):
+            pipeline.build(args)
+        self.assertTrue(Path('out/chrome/built.txt').is_file())
+        self.assertRegex(Path('out/chrome/built.txt').read_text(), '@sha256:[a-f0-9]{64}')
+
+
+if __name__ == '__main__':
+    unittest.main()

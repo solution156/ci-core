@@ -1,0 +1,42 @@
+# Shared defaults; both pipelines include this from the same pinned ci-core ref.
+variables:
+  PYTHON_IMAGE: "rd-harbor-secops.servicemicro.net/build/ci-tools:v1"
+  SHELL_IMAGE: "alpine:3.21"
+  DOCKER_CLI_IMAGE: "docker:27.5.1-cli"
+  DIND_IMAGE: "docker:27.5.1-dind"
+  TRIVY_IMAGE: "rd-harbor-secops.servicemicro.net/build/trivy:0.67.2"
+  COSIGN_IMAGE: "rd-harbor-secops.servicemicro.net/build/cosign:v2.4.1-dev"
+  DEVGUARD_SCANNER_IMAGE: "rd-harbor-secops.servicemicro.net/build/devguard-scanner:v1.16.0"
+  HEAVY_RESOURCE_GROUP: "workspace-heavy"
+  GIT_DEPTH: "0"
+  TRIVY_NO_PROGRESS: "true"
+  TRIVY_SKIP_VERSION_CHECK: "true"
+  TRIVY_IMAGE_SRC: "remote"
+  DEVGUARD_ENABLED: "false"
+  EXTENSION_BOOTSTRAP: ""
+  TRIVY_SCAN_SEVERITY: "HIGH,CRITICAL"
+  TRIVY_GATE_SEVERITY: "CRITICAL"
+  TRIVY_PATCH_SEVERITY: "HIGH,CRITICAL"
+  AUTO_PATCH_OS: "true"
+  PATCH_PACKAGE_EXCLUDE: "google-chrome-stable firefox firefox-esr opera-stable microsoft-edge-stable"
+
+.tools:
+  image: $PYTHON_IMAGE
+  before_script:
+    - command -v python3
+    - command -v git
+  script:
+    - |
+      set -eu
+      : "${CI_CORE_PROJECT:?Missing CI_CORE_PROJECT}"
+      : "${CI_CORE_REF:?Missing CI_CORE_REF}"
+      # Same immutable tag as include; don't save CI_JOB_TOKEN in the remote URL.
+      git -c 'credential.helper=!f() { test "$1" = get && printf "username=gitlab-ci-token\npassword=%s\n" "$CI_JOB_TOKEN"; }; f' \
+        clone --quiet --depth 1 --branch "$CI_CORE_REF" \
+        "$CI_SERVER_URL/$CI_CORE_PROJECT.git" .ci-tools
+      test -f .ci-tools/scripts/pipeline.py
+      # Do not artifact credentials, credential helper state or repository config.
+      python3 -c 'import shutil; shutil.rmtree(".ci-tools/.git")'
+  artifacts:
+    expire_in: 2 days
+    paths: [.ci-tools/]

@@ -1,0 +1,81 @@
+# Parent validates the source and creates a native GitLab dynamic child pipeline.
+include:
+  - local: /templates/common.yaml
+stages: [validate, plan, build, scan, sign, promote, cleanup]
+
+ci:tools:
+  extends: .tools
+  stage: validate
+  needs: []
+
+validate:catalog:
+  stage: validate
+  image: $PYTHON_IMAGE
+  needs:
+    - job: ci:tools
+      artifacts: true
+  script:
+    - python3 .ci-tools/scripts/pipeline.py validate
+
+validate:shell:
+  stage: validate
+  image: $SHELL_IMAGE
+  needs: []
+  before_script:
+    - command -v bash >/dev/null || apk add --no-cache bash
+  script:
+    - find images shared -type f -name '*.sh' -exec bash -n '{}' ';'
+
+security:source:
+  stage: validate
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  needs: []
+  script:
+    - mkdir -p reports
+    - trivy fs --scanners secret,misconfig --severity HIGH,CRITICAL --exit-code 1 --format json --output reports/source.json --skip-dirs .ci-tools .
+    - test -s reports/source.json
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths: [reports/source.json]
+
+prepare:plan:
+  stage: plan
+  image: $PYTHON_IMAGE
+  needs:
+    - {job: 'ci:tools', artifacts: true}
+    - {job: 'validate:catalog', artifacts: false}
+    - {job: 'validate:shell', artifacts: false}
+    - {job: 'security:source', artifacts: false}
+  script:
+    - python3 .ci-tools/scripts/plan.py --output generated-child.yml
+    - cat pipeline-plan.json
+  artifacts:
+    expire_in: 7 days
+    paths: [generated-child.yml, pipeline-plan.json]
+
+pipeline:images:
+  stage: build
+  needs:
+    - {job: 'prepare:plan', artifacts: true}
+  # Trigger/bridge jobs have no image, services or script.
+  trigger:
+    include:
+      - artifact: generated-child.yml
+        job: prepare:plan
+    strategy: mirror  # GitLab >=18.2; use depend for older installations.
+    forward:
+      yaml_variables: true
+      pipeline_variables: false
+
+cleanup:root:
+  stage: cleanup
+  image: $SHELL_IMAGE
+  when: always
+  needs:
+    - job: pipeline:images
+      artifacts: false
+  script:
+    - echo 'Only job-local files are disposable; no daemon prune or registry deletion.'

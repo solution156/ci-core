@@ -1,0 +1,15 @@
+# Core tests need PyYAML only for local YAML checks, not for runtime planner.
+stages: [validate]
+validate:python:
+  image: rd-harbor-secops.servicemicro.net/build/ci-tools:v1
+  stage: validate
+  before_script:
+    # Mirror this dependency or use an internal test image in restricted networks.
+    - python3 -m pip install --disable-pip-version-check -r tests/requirements.txt
+  script:
+    - python3 -m compileall -q scripts tests
+    - python3 -m unittest discover -s tests -v
+    - python3 scripts/plan.py --help
+    - python3 scripts/pipeline.py --help
+    - python3 scripts/harbor.py --help
+    - python3 scripts/release.py --help
