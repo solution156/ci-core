@@ -326,10 +326,11 @@ def plan():
         row = index[name]
         if requested_version is not None and requested_version != row['version']:
             fail(f'{name}: ref yêu cầu v{requested_version} nhưng images.json ghi {row["version"]}')
-        final = ('main' if ref_kind == 'main' else
-                 f'rc-{row["version"]}' if ref_kind == 'rc' else
-                 row['version'] if ref_kind == 'release' else '')
-        candidate = f'ci-p{root_pipeline}-{short_sha}'
+        candidate = f"{row['version']}-dev"
+        if ref_kind == 'release':
+            final = row['version']
+        else:
+            final = f"{row['version']}-rc"
         # Ensure source-controlled release repo cannot silently change the target name.
         ref(row, candidate)
         if final:
