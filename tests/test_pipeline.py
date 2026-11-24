@@ -66,7 +66,7 @@ class PipelineTests(unittest.TestCase):
             'CI_PIPELINE_ID': '42', 'CI_COMMIT_SHA': 'a' * 40,
             'CI_CORE_PROJECT': 'group/ci-core', 'CI_CORE_REF': 'v2.0.0',
             'HARBOR_REGISTRY': 'registry.example.test', 'HARBOR_PROJECT': 'images',
-            'EXTENSION_BOOTSTRAP': '', 'ROOT_PIPELINE_ID': '42', 'CI_JOB_ID': '12345',
+            'ROOT_PIPELINE_ID': '42', 'CI_JOB_ID': '12345',
             'CI_PROJECT_DIR': str(self.root),
         }, clear=True)
         self.env.start()
@@ -88,6 +88,61 @@ class PipelineTests(unittest.TestCase):
 
     def full(self):
         os.environ.update(PIPELINE_KIND='full', CI_COMMIT_BRANCH='main', CI_COMMIT_REF_PROTECTED='true')
+
+    def test_fast_catalog_allows_uninitialized_lock_but_full_plan_rejects_it(self):
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'vscode')['enabled'] = True
+        Path('images.json').write_text(json.dumps(data))
+        import pipeline
+        pipeline.validate(None)
+        self.assertIn('vscode', [row['id'] for row in catalog.catalog(strict_locks=False)])
+        self.full()
+        with self.assertRaisesRegex(SystemExit, 'extensions.lock'):
+            catalog.plan()
+
+    def test_fast_vscode_smoke_resolves_and_exports_missing_lock(self):
+        import pipeline
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'vscode')['enabled'] = True
+        Path('images.json').write_text(json.dumps(data))
+        os.environ.update(IMAGE_ID='vscode', ROOT_PIPELINE_ID='42')
+        calls = []
+        def record(cmd, capture=False):
+            calls.append(cmd)
+            if cmd[1:3] == ['buildx', 'build']:
+                pass
+            elif cmd[1] == 'create':
+                return 'c' * 64
+            elif cmd[1] == 'cp':
+                Path(cmd[-1]).write_text('fixture.extension@1.2.3' + chr(10))
+            return ''
+        with patch.object(pipeline, 'run', record), patch.object(pipeline, 'runtime_check'):
+            pipeline.build(type('Args', (), {'command': 'smoke', 'dry_run': False})())
+        build = next(command for command in calls if command[1:3] == ['buildx', 'build'])
+        self.assertIn('--build-arg', build)
+        self.assertIn('EXTENSION_MODE=resolve', build)
+        self.assertTrue(Path('out/vscode/extensions.lock').is_file())
+        self.assertTrue(any(command[1] == 'cp' for command in calls))
+        self.assertTrue(any(command[1] == 'rm' for command in calls))
+
+    def test_builder_network_driver_option_is_optional_and_validated(self):
+        import pipeline
+        os.environ.update(HTTP_PROXY='', HTTPS_PROXY='', NO_PROXY='', http_proxy='', https_proxy='', no_proxy='')
+        os.environ.pop('BUILDX_BUILDER_NETWORK', None)
+        commands = []
+        with patch.object(pipeline, 'run', lambda cmd, capture=False: commands.append(cmd) or ''):
+            pipeline.initialize_builder()
+        self.assertFalse(any(arg.startswith('network=') for arg in commands[0]))
+        os.environ['BUILDX_BUILDER_NETWORK'] = 'host'
+        commands.clear()
+        with patch.object(pipeline, 'run', lambda cmd, capture=False: commands.append(cmd) or ''):
+            pipeline.initialize_builder()
+        self.assertIn('network=host', commands[0])
+        os.environ['BUILDX_BUILDER_NETWORK'] = 'host;rm -rf /'
+        with patch.object(pipeline, 'run') as run:
+            with self.assertRaisesRegex(SystemExit, 'BUILDX_BUILDER_NETWORK'):
+                pipeline.initialize_builder()
+            run.assert_not_called()
 
     def test_main_builds_all_enabled_even_without_diff(self):
         self.full()
@@ -187,14 +242,29 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, 'lock'):
             catalog.catalog()
 
-    def test_explicit_bootstrap_allows_uninitialized_lock_only_for_bootstrap(self):
-        os.environ.update(EXTENSION_BOOTSTRAP='vscode', CI_PIPELINE_SOURCE='web')
-        result = catalog.plan()
-        self.assertEqual(result['mode'], 'bootstrap')
+    def test_push_build_rejects_uninitialized_lock(self):
+        import pipeline
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'vscode')['enabled'] = True
+        Path('images.json').write_text(json.dumps(data))
+        self.full()
+        os.environ.update(IMAGE_ID='vscode')
+        with patch.object(pipeline, 'run') as run:
+            with self.assertRaisesRegex(SystemExit, 'extensions.lock'):
+                pipeline.build(type('Args', (), {'command': 'build', 'dry_run': False})())
+            run.assert_not_called()
+
+    def test_fast_plan_can_select_vscode_with_uninitialized_lock(self):
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'vscode')['enabled'] = True
+        Path('images.json').write_text(json.dumps(data))
+        os.environ.update(CI_PIPELINE_SOURCE='web', IMAGE_SELECTION='vscode')
+        selected = catalog.plan()
+        self.assertEqual(selected['mode'], 'fast')
+        self.assertEqual([row['id'] for row in selected['images']], ['vscode'])
         plan.generate('generated.yml')
-        data = yaml.safe_load(Path('generated.yml').read_text())
-        self.assertIn('lock:vscode', data)
-        self.assertFalse(any(k.startswith(('sign:', 'promote:')) for k in data))
+        generated = yaml.safe_load(Path('generated.yml').read_text())
+        self.assertEqual(generated['build:vscode']['extends'], '.workspace-smoke')
 
     def test_parent_trigger_is_native_gitlab_trigger(self):
         data = yaml.safe_load((CORE / 'templates/workspace-parent.yaml').read_text())

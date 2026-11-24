@@ -41,10 +41,6 @@ def generate(output):
             return name
         for row in selection['images']:
             name = row['id']
-            if selection['mode'] == 'bootstrap':
-                lock = job('lock', '.workspace-lock', row, ['ci:tools'])
-                job('cleanup', '.workspace-cleanup', row, [lock], when='always')
-                continue
             if selection['mode'] == 'fast':
                 smoke = job('build', '.workspace-smoke', row, ['ci:tools'])
                 job('cleanup', '.workspace-cleanup', row, [smoke], when='always')

@@ -11,7 +11,7 @@
 
 Parent: validate → plan → native trigger → cleanup.
 
-- `templates/common.yaml`: defaults và bootstrap scripts chung, dùng cùng một ref.
+- `templates/common.yaml`: defaults và script dùng chung, pin cùng một ref.
 - `templates/workspace-parent.yaml`: catalog/shell/source validation, sinh dynamic child artifact.
 - `templates/workspace-child.yaml`: hidden templates cho từng loại công việc.
 - `scripts/plan.py`: sinh JSON hợp lệ dưới dạng YAML; runtime chỉ dùng Python standard library.
@@ -50,30 +50,20 @@ build -> scan -> patch -> verify:trivy + verify:runtime
 - MR diff dùng `CI_MERGE_REQUEST_DIFF_BASE_SHA`; push dùng `CI_COMMIT_BEFORE_SHA`; fallback hiện tại `HEAD^`. Với nhánh mới nhiều commit trước lần push đầu, nên dùng MR để có base đầy đủ hoặc manual selection.
 - Shared dependency trong catalog chỉ làm rebuild các image khai báo liên quan; thay `.dockerignore` có thể ảnh hưởng mọi image. Main FULL all là yêu cầu riêng, không phải thiếu selective-build support.
 
-## 3. VS Code: bootstrap không cần cài trên host
+## 3. Tạo extension lock cho VS Code ngay trong FAST build
 
-Lỗi gốc là lockfile chỉ chứa comment, trong khi Dockerfile mặc định `EXTENSION_MODE=locked`. Không thể tự tạo version giả hoặc tắt validation để gọi là đã sửa.
+`images/vscode/configs/extensions.txt` liệt kê ID extension; `extensions.lock` ghim phiên bản cụ thể. Dockerfile mặc định dùng `EXTENSION_MODE=locked`, vì vậy các build FULL/RELEASE vẫn yêu cầu lock khớp toàn bộ manifest.
 
-Catalog giờ có `extension_lock` metadata (`manifest`, `lock`, `generated`) và `runtime_check` hook. Không cần hardcode tên `vscode` trong planner/runtime.
+Khi VS Code được bật trên nhánh phát triển nhưng lock còn trống hoặc cũ, smoke build FAST thông thường sẽ:
 
-Quy trình GitLab:
+1. Chỉ nới kiểm tra tính đầy đủ của lock trong FAST; manifest/cấu hình sai vẫn bị từ chối.
+2. Build image thật với `EXTENSION_MODE=resolve`, cài extensions và ghi lại phiên bản đã cài.
+3. Trích `/opt/dwf-vscode/extensions.lock.generated` từ smoke image local thành artifact `out/vscode/extensions.lock`.
+4. Chạy các smoke/runtime check như trước. FAST không push image lên Harbor.
 
-1. Giữ `enabled:false` trong lần bootstrap đầu. Hoặc nếu đã bật, bootstrap chỉ bỏ qua kiểm tra lock của đúng image được yêu cầu.
-2. Run pipeline trên development branch hoặc protected main, đặt **duy nhất** `EXTENSION_BOOTSTRAP=vscode`; giữ `IMAGE_SELECTION=auto`.
-3. Parent kiểm tra manifest, child có `lock:vscode` (không sign/promote).
-4. Job build Docker với `EXTENSION_MODE=resolve`, cài extensions thật, dùng CLI của image kiểm tra phiên bản đã cài, xuất `out/vscode/extensions.lock` artifact.
-5. Tải artifact, review rồi commit nội dung vào `images/vscode/configs/extensions.lock`. Sau đó đổi `enabled:true` và chạy FAST/review MR.
-6. FULL/RELEASE vẫn bắt buộc lock khớp toàn bộ manifest. Lock sai format/trùng/thiếu/thừa ID đều fail trước build.
+Tải artifact từ job `build:vscode`, xem lại rồi commit nội dung vào `images/vscode/configs/extensions.lock`. Sau đó cập nhật MR. FULL/RELEASE vẫn từ chối lock thiếu, sai định dạng, trùng ID, thiếu ID hoặc thừa ID trước khi publish image. Khi lock đã khớp, FAST cũng quay lại chế độ locked thông thường.
 
-Bootstrap local với Docker, không cần VS Code trên host:
-
-```bash
-cd /root/kubeworkspace/workspace-images
-IMAGE_ID=vscode WORKSPACE_REF_KIND=bootstrap PARENT_PIPELINE_SOURCE=web \
-ROOT_PIPELINE_ID=20261122 /usr/bin/python3 ../ci-core/scripts/pipeline.py lock
-```
-
-Lệnh này pull base và tải extension qua mạng, có thể tốn nhiều GB. Không tự commit/enable image. Đối với extension private/proxy/CA, cần cấu hình riêng; không đưa token vào build args hoặc layer.
+Để thử: bật VS Code trong `images.json` trên nhánh phát triển và thay đổi một file dưới `images/vscode/` (hoặc dùng Run pipeline với `IMAGE_SELECTION=vscode`). FAST plan thông thường sẽ chọn image; không cần biến/job bootstrap riêng. Quá trình resolve cần runner truy cập được base image và VS Code Marketplace. Nếu không truy cập được, smoke job sẽ thất bại và không tạo được artifact lock hợp lệ.
 
 ## 4. Variables và quyền truy cập
 
@@ -85,6 +75,7 @@ Có defaults trong YAML, không cần khai báo lại tất cả:
 - `DOCKER_CLI_IMAGE`, `DIND_IMAGE`: default Docker27.5.1 CLI/DinD.
 - `SHELL_IMAGE`, `TRIVY_IMAGE`, `COSIGN_IMAGE`, `DEVGUARD_SCANNER_IMAGE`: có thể mirror/override nội bộ.
 - `HEAVY_RESOURCE_GROUP=workspace-heavy`: serialize Docker build/patch/runtime trong cùng GitLab project.
+- `BUILDX_BUILDER_NETWORK` (mặc định rỗng): tùy chọn truyền network mode/name cho Buildx docker-container builder để điều tra kết nối. Không đổi mặc định, không cấu hình DNS/proxy; cần xác minh trên runner đích. Lỗi DNS quan sát được chưa đủ để kết luận network option này là nguyên nhân/giải pháp.
 - `TRIVY_SCAN_SEVERITY`, `TRIVY_GATE_SEVERITY`, `TRIVY_PATCH_SEVERITY`, `AUTO_PATCH_OS`, `PATCH_PACKAGE_EXCLUDE`.
 - `DEVGUARD_ENABLED=false` mặc định; khi bật cần asset/API/token riêng.
 
@@ -135,7 +126,7 @@ Runtime CLI `pipeline.py`, `harbor.py`, `release.py` hỗ trợ `--dry-run` đ�
 4. Consumer đã chuẩn bị include và `CI_CORE_REF=v2.1.0`. Chỉ push consumer sau khi tag chứa file mới tồn tại. Nếu dùng version khác, đổi cả hai vị trí cùng lúc.
 5. Dùng CI Lint/Pipeline Editor trên **GitLab thật** để resolve cross-project includes và validate config. YAML parse local không tương đương GitLab semantic validation.
 6. Run pipeline `feature/chrome` với `IMAGE_SELECTION=chrome`: parent xanh và child build/runtime xanh; không có sign/promote.
-7. Bootstrap VSCode, commit verified lock rồi enable, chạy FAST.
+7. Với VS Code chưa có lock hợp lệ, chạy FAST trên branch, tải/review artifact lock, commit lock qua MR rồi xác nhận FULL strict.
 8. Test FULL trên protected main với các credential/CA/proxy chuẩn. Kiểm đủ scan/patch/verify/SBOM/evidence/sign/promote chứ không dừng ở build xanh.
 9. Test protected release tag cho một image; so sánh digest trong registry với report/evidence. Retry không được đổi immutable release sang digest khác.
 

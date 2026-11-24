@@ -8,7 +8,7 @@ import pathlib
 import re
 import tempfile
 from catalog import (catalog, one, ref, run, env, require, document, write, fail,
-                     bootstrap_target, checked_path, docker_config_path, job_builder_name)
+                     checked_path, docker_config_path, job_builder_name, lock_config)
 
 PROXIES = ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy')
 
@@ -30,12 +30,17 @@ def build_arguments():
 def initialize_builder():
     name = job_builder_name()
     config = docker_config_path()
+    network = env('BUILDX_BUILDER_NETWORK')
+    if network and network not in ('host', 'none', 'bridge') and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', network):
+        fail('BUILDX_BUILDER_NETWORK phải là host, none, bridge hoặc tên network hợp lệ')
     config.mkdir(mode=0o700, parents=True, exist_ok=True)
     marker = config / 'buildx-builder'
     fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w', encoding='utf-8') as output:
         output.write(name + '\n')
     command = ['docker', 'buildx', 'create', '--name', name, '--driver', 'docker-container']
+    if network:
+        command += ['--driver-opt', 'network=' + network]
     for variable in PROXIES:
         value = os.environ.get(variable)
         if value:
@@ -49,15 +54,16 @@ def initialize_builder():
 
 
 def validate(_):
-    rows = catalog(bootstrap=bootstrap_target())
+    rows = catalog(strict_locks=env('PIPELINE_KIND') != 'fast')
     print('Validated', len(rows), 'image entries:')
     for row in rows:
         print(f'  {row["id"]:18} {row["version"]:12} enabled={row["enabled"]} shared={row["depends_on"]}')
 
 
 def build(args):
-    row = one(require('IMAGE_ID'))
     fast = args.command == 'smoke'
+    row = one(require('IMAGE_ID'), strict_locks=not fast)
+    resolve_lock = fast and bool(row.get('extension_lock')) and not lock_config(row, strict=False)
     if not fast and env('CI_COMMIT_REF_PROTECTED') != 'true':
         fail('Build push requires protected ref')
     tag = ('smoke-p' + require('ROOT_PIPELINE_ID')
@@ -86,9 +92,14 @@ def build(args):
             '--provenance=mode=min', '--sbom=true',
             '--metadata-file', str(metadata_file),
         ]
-    command += build_arguments() + [row['context']]
+    command += build_arguments()
+    if resolve_lock:
+        command += ['--build-arg', 'EXTENSION_MODE=resolve']
+    command += [row['context']]
     run(command)
     if fast:
+        if resolve_lock:
+            extract_extension_lock(row, reference)
         runtime_check(row, reference)
         write(path(row['id'], 'smoke.json'), {'id': row['id'], 'result': 'pass', 'pushed': False})
         print('FAST local build/runtime OK; không push:', row['id'])
@@ -102,6 +113,20 @@ def build(args):
         'root_pipeline': require('ROOT_PIPELINE_ID'),
     })
 
+
+def extract_extension_lock(row, reference):
+    config = row['extension_lock']
+    container = run(['docker', 'create', reference], capture=True)
+    if not re.fullmatch(r'[a-f0-9]{12,64}', container):
+        fail('Docker create trả container ID sai khi trích xuất extensions.lock')
+    target = path(row['id'], 'extensions.lock')
+    try:
+        run(['docker', 'cp', container + ':' + config['generated'], str(target)])
+        if not target.is_file() or not target.stat().st_size:
+            fail(f'{row["id"]}: bootstrap không xuất được lockfile')
+    finally:
+        run(['docker', 'rm', container])
+    print(f'Extension lock artifact generated: {target}; review and commit it.')
 
 def metadata_digest(reference, metadata_file):
     metadata = document(metadata_file)
@@ -126,33 +151,6 @@ def runtime_check(row, reference):
         with checked_path(row['runtime_check']).open('rb') as source:
             import subprocess
             subprocess.run(['docker', 'run', '--rm', '-i', '--network', 'none', '--entrypoint', '/bin/bash', reference, '-s'], stdin=source, check=True)
-
-
-def lock(_args):
-    name = require('IMAGE_ID')
-    if env('WORKSPACE_REF_KIND') != 'bootstrap' or env('PARENT_PIPELINE_SOURCE') != 'web':
-        fail('Lock resolve chỉ qua bootstrap child từ Run pipeline')
-    rows = {r['id']: r for r in catalog(bootstrap=name)}
-    if name not in rows or 'extension_lock' not in rows[name]:
-        fail('Image chưa khai báo extension_lock')
-    row = rows[name]
-    local = 'sdwf-lock-' + require('ROOT_PIPELINE_ID') + '-' + name
-    builder = initialize_builder()
-    run(['docker', 'buildx', 'build', '--builder', builder,
-         '--load', '--pull', '--progress=plain', '--platform', row['platform'],
-         '--build-arg', 'EXTENSION_MODE=resolve', '-f', row['dockerfile'], '-t', local,
-         *build_arguments(), row['context']])
-    container = run(['docker', 'create', local], capture=True)
-    if not re.fullmatch(r'[a-f0-9]{12,64}', container):
-        fail('Docker create trả container ID sai')
-    try:
-        target = path(name, 'extensions.lock')
-        run(['docker', 'cp', container + ':' + row['extension_lock']['generated'], str(target)])
-        if not target.is_file() or not target.stat().st_size:
-            fail('Bootstrap không xuất được lockfile')
-    finally:
-        run(['docker', 'rm', container])
-    print('Download verified lock artifact, review/commit it, then enable the image.')
 
 
 def patch_candidates(report):
@@ -234,14 +232,14 @@ def runtime(_args):
 
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument('command', choices=('validate', 'smoke', 'build', 'patch', 'runtime', 'lock'))
+    cli.add_argument('command', choices=('validate', 'smoke', 'build', 'patch', 'runtime'))
     cli.add_argument('--dry-run', action='store_true', help='Show intent only; no Docker/network/file mutations')
     args = cli.parse_args()
     if args.dry_run:
         print('DRY-RUN:', args.command, 'image=' + env('IMAGE_ID'), '(no commands executed)')
         return
     try:
-        {'validate': validate, 'smoke': build, 'build': build, 'patch': patch, 'runtime': runtime, 'lock': lock}[args.command](args)
+        {'validate': validate, 'smoke': build, 'build': build, 'patch': patch, 'runtime': runtime}[args.command](args)
     except (OSError, ValueError, KeyError) as exc:
         fail(str(exc))
 

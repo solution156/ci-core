@@ -69,10 +69,10 @@ def checked_path(value):
     return path
 
 
-def lock_config(row, bootstrap=False):
+def lock_config(row, strict=True):
     config = row.get('extension_lock')
     if config is None:
-        return
+        return True
     if not isinstance(config, dict) or set(config) != {'manifest', 'lock', 'generated'}:
         fail(f'{row["id"]}: extension_lock cần manifest, lock, generated')
     manifest = checked_path(config['manifest'])
@@ -85,31 +85,24 @@ def lock_config(row, bootstrap=False):
     wanted = entries(manifest)
     if not wanted or any(not re.fullmatch(r'[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', s) for s in wanted) or len(set(s.lower() for s in wanted)) != len(wanted):
         fail(f'{row["id"]}: extension manifest không hợp lệ')
-    if not row['enabled'] or bootstrap:
-        return
+    if not row['enabled']:
+        return True
     locked = entries(lock)
     pins = {}
+    valid = True
     for spec in locked:
         match = re.fullmatch(r'([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)@(\d+\.\d+\.\d+(?:[.-][A-Za-z0-9.-]+)?)', spec)
         if not match or match[1].lower() in pins:
-            fail(f'{row["id"]}: extensions.lock entry sai/trùng')
+            valid = False
+            break
         pins[match[1].lower()] = match[2]
-    if set(pins) != {s.lower() for s in wanted}:
-        fail(f'{row["id"]}: extensions.lock thiếu/thừa ID; chạy Run pipeline EXTENSION_BOOTSTRAP={row["id"]}, commit lock artifact rồi enable')
+    valid = valid and set(pins) == {s.lower() for s in wanted}
+    if not valid and strict:
+        fail(f'{row["id"]}: extensions.lock không hợp lệ; chạy FAST trên branch, tải và commit lock artifact')
+    return valid
 
 
-def bootstrap_target():
-    target = env('EXTENSION_BOOTSTRAP')
-    if target and (env('CI_PIPELINE_SOURCE') != 'web' or env('CI_COMMIT_TAG') or
-                   not (DEV_BRANCH.fullmatch(env('CI_COMMIT_BRANCH')) or
-                        (env('CI_COMMIT_BRANCH') == 'main' and env('CI_COMMIT_REF_PROTECTED') == 'true'))):
-        fail('EXTENSION_BOOTSTRAP chỉ qua Run pipeline trên branch phát triển hoặc protected main')
-    if target and not ID.fullmatch(target):
-        fail('EXTENSION_BOOTSTRAP ID không hợp lệ')
-    return target
-
-
-def catalog(bootstrap=None):
+def catalog(strict_locks=True):
     source = document('images.json')
     if source.get('schema_version') != 2 or not isinstance(source.get('images'), list):
         fail('images.json phải có schema_version=2 và mảng images')
@@ -168,7 +161,7 @@ def catalog(bootstrap=None):
                                if x.startswith('shared/'))
         if not shared_copy <= set(deps):
             fail(f'{name}: Dockerfile COPY shared chưa có depends_on: {sorted(shared_copy - set(deps))}')
-        lock_config(row, bootstrap == name)
+        lock_config(row, strict=strict_locks)
         if 'runtime_check' in row:
             checked_path(row['runtime_check'])
         result.append(row)
@@ -181,8 +174,8 @@ def catalog(bootstrap=None):
     return result
 
 
-def one(name):
-    rows = {r['id']: r for r in catalog()}
+def one(name, strict_locks=True):
+    rows = {r['id']: r for r in catalog(strict_locks=strict_locks)}
     if name not in rows or not rows[name]['enabled']:
         fail(f'Image không tồn tại hoặc chưa enable: {name}')
     return rows[name]
@@ -268,28 +261,14 @@ def changed_images(rows):
 
 
 def plan():
-    bootstrap = bootstrap_target()
-    rows = catalog(bootstrap=bootstrap)
-    index = {x['id']: x for x in rows}
-    if bootstrap:
-        if bootstrap not in index or 'extension_lock' not in index[bootstrap]:
-            fail('Image bootstrap phải khai báo extension_lock')
-        if env('IMAGE_SELECTION', 'auto') != 'auto':
-            fail('Không kết hợp EXTENSION_BOOTSTRAP và IMAGE_SELECTION')
-        pid = require('CI_PIPELINE_ID')
-        if not pid.isdigit():
-            fail('CI_PIPELINE_ID phải là số')
-        row = index[bootstrap]
-        return {'mode': 'bootstrap', 'ref_kind': 'bootstrap', 'source': 'web',
-                'ref': env('CI_COMMIT_BRANCH'), 'commit': require('CI_COMMIT_SHA'),
-                'pipeline_id': pid, 'reason': 'explicit-lock-bootstrap',
-                'images': [dict(row, candidate_tag='lock-p' + pid, final_tag='')]}
     mode = require('PIPELINE_KIND')
+    if mode not in ('fast', 'full', 'release'):
+        fail(f'PIPELINE_KIND không hợp lệ: {mode}')
+    rows = catalog(strict_locks=mode != 'fast')
+    index = {x['id']: x for x in rows}
     branch, tag, src = env('CI_COMMIT_BRANCH'), env('CI_COMMIT_TAG'), env('CI_PIPELINE_SOURCE')
     protected = env('CI_COMMIT_REF_PROTECTED') == 'true'
     ref_kind = ''
-    if mode not in ('fast', 'full', 'release'):
-        fail(f'PIPELINE_KIND không hợp lệ: {mode}')
     if mode != 'fast' and not protected:
         fail('FULL/RELEASE yêu cầu protected Git ref')
     release = RELEASE_TAG.fullmatch(tag) if tag else None

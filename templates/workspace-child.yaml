@@ -62,16 +62,6 @@ ci:tools:
     expire_in: 2 days
     paths: ['out/$IMAGE_ID/']
 
-.workspace-lock:
-  extends: .workspace-docker
-  stage: build
-  interruptible: true
-  script:
-    - python3 .ci-tools/scripts/pipeline.py lock
-  artifacts:
-    expire_in: 7 days
-    paths: ['out/$IMAGE_ID/extensions.lock']
-
 .workspace-build:
   extends: .workspace-docker
   stage: build

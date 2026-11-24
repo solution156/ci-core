@@ -169,28 +169,6 @@ class Contracts(PipelineTests):
                 harbor.snapshot(None)
         self.assertFalse(Path('out/chrome/verified.txt').exists())
 
-    def test_bootstrap_rejects_push(self):
-        os.environ['EXTENSION_BOOTSTRAP'] = 'vscode'
-        with self.assertRaises(SystemExit):
-            catalog.plan()
-
-    def test_lock_runtime_never_pushes_and_extracts_artifact(self):
-        os.environ.update(IMAGE_ID='vscode', WORKSPACE_REF_KIND='bootstrap', PARENT_PIPELINE_SOURCE='web')
-        commands = []
-        def record(cmd, capture=False):
-            commands.append(cmd)
-            if cmd[1] == 'create':
-                return 'c'*64
-            if cmd[1] == 'cp':
-                Path(cmd[-1]).write_text('fixture.extension@1.2.3\n')
-            return ''
-        with patch.object(pipeline, 'run', record):
-            pipeline.lock(None)
-        self.assertTrue(Path('out/vscode/extensions.lock').exists())
-        self.assertFalse(any(c[1] == 'push' for c in commands))
-        self.assertTrue(any('EXTENSION_MODE=resolve' in c for c in commands))
-        self.assertEqual(commands[-1][:2], ['docker', 'rm'])
-
     def test_valid_lock_can_enable_vscode(self):
         data = json.loads(Path('images.json').read_text())
         row = next(r for r in data['images'] if r['id'] == 'vscode')
