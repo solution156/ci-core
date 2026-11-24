@@ -80,6 +80,50 @@ class Contracts(PipelineTests):
                     self.assertIsInstance(command, str)
                     self.assertNotIn('docker system prune', command)
 
+    def test_dind_proxy_values_are_forwarded_without_hardcoded_urls(self):
+        cfg = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
+        service = cfg['.workspace-docker']['services'][0]
+        job_variables = cfg['.workspace-docker']['variables']
+        self.assertEqual(job_variables['DIND_HTTP_PROXY'], '$HTTP_PROXY')
+        self.assertEqual(job_variables['DIND_HTTPS_PROXY'], '$HTTPS_PROXY')
+        self.assertEqual(job_variables['DIND_NO_PROXY'], '$NO_PROXY')
+        self.assertEqual(service['entrypoint'], ['/bin/sh', '-c'])
+        wrapper = service['command'][0]
+        self.assertIn('HTTP_PROXY="${DIND_HTTP_PROXY:-}"', wrapper)
+        self.assertIn('HTTPS_PROXY="${DIND_HTTPS_PROXY:-}"', wrapper)
+        self.assertIn('NO_PROXY="${DIND_NO_PROXY:-}"', wrapper)
+        self.assertIn('exec dockerd-entrypoint.sh --tls=false', wrapper)
+        self.assertNotIn('variables', service)
+        self.assertNotIn('proxy.', json.dumps(service).lower())
+
+    def test_production_build_uses_registry_cache_attestations_and_metadata_digest(self):
+        self.full()
+        os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-p42-' + os.environ['CI_COMMIT_SHA'][:12],
+                          IMAGE_FINAL_TAG='0.1.0-dev')
+        commands = []
+
+        def record(cmd, capture=False):
+            commands.append(cmd)
+            if cmd[:3] == ['docker', 'buildx', 'build']:
+                metadata = Path(cmd[cmd.index('--metadata-file') + 1])
+                metadata.parent.mkdir(parents=True, exist_ok=True)
+                metadata.write_text(json.dumps({'containerimage.digest': 'sha256:' + 'b' * 64}))
+            return ''
+
+        args = type('Args', (), {'command': 'build', 'dry_run': False})()
+        with patch.object(pipeline, 'run', record):
+            pipeline.build(args)
+        build = commands[0]
+        self.assertIn('--push', build)
+        self.assertNotIn('--load', build)
+        self.assertIn('--cache-from', build)
+        self.assertIn('--cache-to', build)
+        self.assertIn('--provenance=mode=max', build)
+        self.assertIn('--sbom=true', build)
+        self.assertIn('--metadata-file', build)
+        immutable = Path('out/chrome/built.txt').read_text().strip()
+        self.assertEqual(immutable, 'registry.example.test/images/chrome@sha256:' + 'b' * 64)
+
     def test_patch_without_fixes_still_records_pinned_digest(self):
         self.full()
         os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-test')

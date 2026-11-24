@@ -73,6 +73,7 @@ USER 1000
         run('fixture-git-commit', ['git', '-c', 'user.name=Local integration', '-c', 'user.email=local@example.test', 'commit', '-qm', 'Synthetic integration fixture, not production source'], cwd=work)
         sha = run('fixture-git-sha', ['git', 'rev-parse', 'HEAD'], cwd=work)
         env.update(IMAGE_ID='fixture', IMAGE_CANDIDATE_TAG='ci-local-' + runid,
+                   IMAGE_FINAL_TAG='0.1.0-dev',
                    ROOT_PIPELINE_ID=runid, CI_PIPELINE_ID=runid, CI_COMMIT_SHA=sha,
                    CI_PROJECT_URL=work.as_uri(), CI_PROJECT_PATH='local/fixture',
                    CI_PIPELINE_URL=work.as_uri(), CI_COMMIT_BRANCH='main', CI_COMMIT_TAG='',

@@ -34,6 +34,25 @@ file chính: `/templates/workspace-parent.yaml`
 - `CI_CORE_PROJECT` = `hermes156/ci-core`
 - `CI_CORE_REF`   = `v2.1.0`
 
+## Image tag policy
+
+The inventory version in `images.json` is the single source of truth:
+
+- protected `main` pipeline → `{version}-dev`
+- protected `release/<image>/v{version}` pipeline → `{version}-rc`
+- protected `<image>/v{version}` or `release/<image>/v{version}` tag → `{version}`
+
+Builds first use a unique `ci-p<parent-pipeline>-<commit>` candidate tag. Scan,
+SBOM, runtime verification, signing, and promotion operate on its immutable digest.
+This prevents concurrent pipelines from changing the artifact under review.
+
+## Proxy boundaries
+
+Proxy URLs are not stored in this repository. Configure `HTTP_PROXY`,
+`HTTPS_PROXY`, and `NO_PROXY` as GitLab CI/CD variables. The child template
+forwards them to the DinD service and BuildKit build arguments when present.
+Runner-host proxy and registry CA trust remain runner-administrator concerns.
+
 ## CI Pipeline (from workspace-images)
 
 ### validate
@@ -46,8 +65,9 @@ file chính: `/templates/workspace-parent.yaml`
 - Create plan artifacts
 
 ### build
-- Docker build for each image in images.json
-- Push to Harbor registry
+- Docker Buildx builds each selected image to a unique pipeline candidate tag.
+- Protected pipelines push directly with registry cache, BuildKit provenance, SBOM attestations, and `build-metadata.json`.
+- The immutable digest from BuildKit metadata is passed to scan, signing, and promotion jobs.
 
 ### scan
 - Trivy vulnerability scan

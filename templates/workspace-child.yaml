@@ -18,8 +18,24 @@ ci:tools:
   services:
     - name: $DIND_IMAGE
       alias: docker
-      command: ["--tls=false"]
+      # Service commands do not expand variables by themselves. An explicit
+      # shell entrypoint maps YAML aliases to dockerd's standard proxy env.
+      entrypoint: ["/bin/sh", "-c"]
+      command:
+        - |
+          export HTTP_PROXY="${DIND_HTTP_PROXY:-}"
+          export HTTPS_PROXY="${DIND_HTTPS_PROXY:-}"
+          export NO_PROXY="${DIND_NO_PROXY:-}"
+          export http_proxy="$HTTP_PROXY"
+          export https_proxy="$HTTPS_PROXY"
+          export no_proxy="$NO_PROXY"
+          exec dockerd-entrypoint.sh --tls=false
   variables:
+    # GitLab UI variables are not exposed directly to service containers.
+    # Alias them in YAML, then pass those aliases to the DinD service.
+    DIND_HTTP_PROXY: $HTTP_PROXY
+    DIND_HTTPS_PROXY: $HTTPS_PROXY
+    DIND_NO_PROXY: $NO_PROXY
     DOCKER_HOST: "tcp://docker:2375"
     DOCKER_TLS_CERTDIR: ""
     DOCKER_BUILDKIT: "1"
@@ -63,7 +79,7 @@ ci:tools:
     - python3 .ci-tools/scripts/pipeline.py build
   artifacts:
     expire_in: 7 days
-    paths: ['out/$IMAGE_ID/build.json', 'out/$IMAGE_ID/built.txt']
+    paths: ['out/$IMAGE_ID/build.json', 'out/$IMAGE_ID/build-metadata.json', 'out/$IMAGE_ID/built.txt']
 
 .workspace-scan:
   image:

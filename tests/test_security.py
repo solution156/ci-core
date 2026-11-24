@@ -57,7 +57,8 @@ class SecurityTests(fixtures.PipelineTests):
         result = catalog.plan()
         self.assertEqual(result['ref_kind'], 'rc')
         self.assertEqual([r['id'] for r in result['images']], ['chrome'])
-        self.assertEqual(result['images'][0]['final_tag'], 'rc-0.1.0')
+        self.assertEqual(result['images'][0]['final_tag'], '0.1.0-rc')
+        self.assertTrue(result['images'][0]['candidate_tag'].startswith('ci-p42-'))
 
     def test_failed_diff_base_is_not_silent_all_build(self):
         os.environ['CI_COMMIT_BEFORE_SHA'] = 'b'*40

@@ -169,8 +169,9 @@ def promote(_args):
         fail('Ref kind không có quyền promote')
     if env('CI_COMMIT_REF_PROTECTED') != 'true':
         fail('Chỉ protected ref được promote')
-    if final != ('main' if kind == 'main' else
-                 'rc-' + row['version'] if kind == 'rc' else row['version']):
+    expected_final = (row['version'] + '-dev' if kind == 'main' else
+                      row['version'] + '-rc' if kind == 'rc' else row['version'])
+    if final != expected_final:
         fail('Final tag không khớp chính sách per-image')
     if kind in ('main', 'rc'):
         assert_current_branch_tip()

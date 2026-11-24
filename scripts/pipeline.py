@@ -41,12 +41,27 @@ def build(args):
     tag = ('smoke-p' + require('ROOT_PIPELINE_ID')
            if fast else require('IMAGE_CANDIDATE_TAG'))
     reference = ref(row, tag)
-    command = ['docker', 'buildx', 'build', '--load', '--pull', '--progress=plain', '--platform', row['platform'],
+    command = ['docker', 'buildx', 'build', '--pull', '--progress=plain', '--platform', row['platform'],
                '-f', row['dockerfile'], '-t', reference,
                '--label', 'org.opencontainers.image.title=' + row['repository'],
                '--label', 'org.opencontainers.image.source=' + env('CI_PROJECT_URL'),
                '--label', 'org.opencontainers.image.revision=' + env('CI_COMMIT_SHA'),
                '--label', 'org.opencontainers.image.version=' + row['version']]
+    metadata_file = path(row['id'], 'build-metadata.json')
+    if fast:
+        command += ['--load']
+    else:
+        # Inline cache works with the default Docker Buildx driver. The previous
+        # stable policy tag is imported as a registry cache source when present;
+        # a missing tag is treated by BuildKit as a cache miss, not a build error.
+        cache = ref(row, require('IMAGE_FINAL_TAG'))
+        command += [
+            '--push',
+            '--cache-from', 'type=registry,ref=' + cache,
+            '--cache-to', 'type=inline',
+            '--provenance=mode=max', '--sbom=true',
+            '--metadata-file', str(metadata_file),
+        ]
     command += build_arguments() + [row['context']]
     run(command)
     if fast:
@@ -54,8 +69,7 @@ def build(args):
         write(path(row['id'], 'smoke.json'), {'id': row['id'], 'result': 'pass', 'pushed': False})
         print('FAST local build/runtime OK; không push:', row['id'])
         return
-    run(['docker', 'push', reference])
-    immutable = pushed_digest(reference)
+    immutable = metadata_digest(reference, metadata_file)
     path(row['id'], 'built.txt').write_text(immutable + '\n', encoding='utf-8')
     write(path(row['id'], 'build.json'), {
         'reference': immutable,
@@ -63,6 +77,14 @@ def build(args):
         'candidate': reference, 'dockerfile': row['dockerfile'], 'platform': row['platform'],
         'root_pipeline': require('ROOT_PIPELINE_ID'),
     })
+
+
+def metadata_digest(reference, metadata_file):
+    metadata = document(metadata_file)
+    digest = metadata.get('containerimage.digest', '')
+    if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
+        fail('BuildKit metadata thiếu containerimage.digest hợp lệ')
+    return reference.rsplit(':', 1)[0] + '@' + digest
 
 
 def pushed_digest(reference):

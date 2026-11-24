@@ -262,6 +262,7 @@ def plan():
     mode = require('PIPELINE_KIND')
     branch, tag, src = env('CI_COMMIT_BRANCH'), env('CI_COMMIT_TAG'), env('CI_PIPELINE_SOURCE')
     protected = env('CI_COMMIT_REF_PROTECTED') == 'true'
+    ref_kind = ''
     if mode not in ('fast', 'full', 'release'):
         fail(f'PIPELINE_KIND không hợp lệ: {mode}')
     if mode != 'fast' and not protected:
@@ -326,11 +327,12 @@ def plan():
         row = index[name]
         if requested_version is not None and requested_version != row['version']:
             fail(f'{name}: ref yêu cầu v{requested_version} nhưng images.json ghi {row["version"]}')
-        candidate = f"{row['version']}-dev"
-        if ref_kind == 'release':
-            final = row['version']
-        else:
-            final = f"{row['version']}-rc"
+        # Build to a unique candidate tag so concurrent pipelines cannot overwrite
+        # the digest being scanned/signed. Promotion creates the stable policy tag.
+        candidate = f'ci-p{root_pipeline}-{short_sha}'
+        final = (f"{row['version']}-dev" if ref_kind == 'main' else
+                 f"{row['version']}-rc" if ref_kind == 'rc' else
+                 row['version'] if ref_kind == 'release' else '')
         # Ensure source-controlled release repo cannot silently change the target name.
         ref(row, candidate)
         if final:

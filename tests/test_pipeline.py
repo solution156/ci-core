@@ -25,7 +25,12 @@ class PipelineTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix='sdwf-tests-', dir=os.environ.get('TMPDIR'))
         self.root = Path(self.tmp.name)
         if WORKSPACE.is_dir():
-            shutil.copytree(WORKSPACE, self.root, dirs_exist_ok=True)
+            shutil.copytree(
+                WORKSPACE,
+                self.root,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns('.git', 'out', 'reports', '__pycache__'),
+            )
         else:
             # Standalone ci-core checkout: synthetic source fixture, not a claimed image build.
             rows = []
@@ -88,6 +93,10 @@ class PipelineTests(unittest.TestCase):
         selected = catalog.plan()
         self.assertEqual(len(selected['images']), 6)
         self.assertEqual(selected['reason'], 'all-enabled-main')
+        self.assertTrue(all(row['final_tag'] == row['version'] + '-dev'
+                            for row in selected['images']))
+        self.assertTrue(all(row['candidate_tag'].startswith('ci-p42-')
+                            for row in selected['images']))
 
     def test_both_release_tag_patterns(self):
         for tag in ('chrome/v0.1.0', 'release/chrome/v0.1.0'):
@@ -193,21 +202,25 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn('image', trigger)
         self.assertEqual(trigger['trigger']['include'][0]['job'], 'prepare:plan')
 
-    def test_runtime_build_pins_digest_after_push(self):
+    def test_runtime_build_pins_digest_from_buildkit_metadata(self):
         import pipeline
         args = type('Args', (), {'command': 'build', 'dry_run': False})()
         self.full()
-        os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-p42-' + os.environ['CI_COMMIT_SHA'][:12])
+        os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-p42-' + os.environ['CI_COMMIT_SHA'][:12],
+                          IMAGE_FINAL_TAG='0.1.0-dev')
         calls = []
         def fake_run(cmd, capture=False):
             calls.append(cmd)
-            if capture:
-                return 'registry.example.test/images/chrome@sha256:' + 'b'*64
+            if cmd[:3] == ['docker', 'buildx', 'build']:
+                metadata = Path(cmd[cmd.index('--metadata-file') + 1])
+                metadata.parent.mkdir(parents=True, exist_ok=True)
+                metadata.write_text(json.dumps({'containerimage.digest': 'sha256:' + 'b' * 64}))
             return ''
         with patch.object(pipeline, 'run', fake_run):
             pipeline.build(args)
         self.assertTrue(Path('out/chrome/built.txt').is_file())
         self.assertRegex(Path('out/chrome/built.txt').read_text(), '@sha256:[a-f0-9]{64}')
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == '__main__':
