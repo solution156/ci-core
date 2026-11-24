@@ -35,6 +35,21 @@ def require(key):
     return value
 
 
+def docker_config_path():
+    root = pathlib.Path(require('CI_PROJECT_DIR')).resolve()
+    path = pathlib.Path(env('DOCKER_CONFIG', str(root / '.docker-job'))).resolve()
+    if path != root / '.docker-job':
+        fail('DOCKER_CONFIG phải là CI_PROJECT_DIR/.docker-job')
+    return path
+
+
+def job_builder_name():
+    job_id = require('CI_JOB_ID')
+    if not re.fullmatch(r'[0-9]+', job_id):
+        fail('CI_JOB_ID không hợp lệ để tạo Buildx builder riêng')
+    return 'workspace-ci-' + job_id
+
+
 def document(path):
     return json.loads(pathlib.Path(path).read_text(encoding='utf-8'))
 
@@ -184,7 +199,17 @@ def ref(row, tag):
 
 
 def run(cmd, capture=False):
-    print('+', ' '.join(shlex.quote(p) for p in cmd), flush=True)
+    display = []
+    redact_next = False
+    for item in cmd:
+        if redact_next:
+            key = item.split('=', 1)[0].strip('"') if '=' in item else item
+            display.append(key + '=[REDACTED]')
+            redact_next = False
+        else:
+            display.append(item)
+            redact_next = item == '--driver-opt'
+    print('+', ' '.join(shlex.quote(p) for p in display), flush=True)
     if capture:
         return subprocess.check_output(cmd, text=True).strip()
     subprocess.run(cmd, check=True)

@@ -4,16 +4,24 @@ import argparse
 import base64
 import json
 import os
-from pathlib import Path
-from catalog import env, fail, require
+import shutil
+from catalog import docker_config_path, env, fail, job_builder_name, require, run
 
 
 def auth_path():
-    root = Path(require('CI_PROJECT_DIR')).resolve()
-    path = Path(env('DOCKER_CONFIG', str(root / '.docker-job'))).resolve()
-    if path != root / '.docker-job':
-        fail('DOCKER_CONFIG phải là CI_PROJECT_DIR/.docker-job')
-    return path
+    return docker_config_path()
+
+
+def cleanup_builder(path):
+    marker = path / 'buildx-builder'
+    if not marker.exists():
+        return
+    name = marker.read_text(encoding='utf-8').strip()
+    if name != job_builder_name():
+        fail('Buildx builder marker không thuộc job hiện tại')
+    builders = run(['docker', 'buildx', 'ls', '--format', '{{.Name}}'], capture=True).splitlines()
+    if name in builders:
+        run(['docker', 'buildx', 'rm', '--force', name])
 
 
 def main():
@@ -22,9 +30,15 @@ def main():
     args = parser.parse_args()
     path = auth_path()
     if args.command == 'cleanup-auth':
+        try:
+            cleanup_builder(path)
+        except (Exception, SystemExit):
+            # Remove credentials even if the daemon cannot remove its builder.
+            (path / 'config.json').unlink(missing_ok=True)
+            raise
         (path / 'config.json').unlink(missing_ok=True)
         if path.exists():
-            path.rmdir()
+            shutil.rmtree(path)
         return
     registry = require('HARBOR_REGISTRY')
     # Never put push credentials into FAST/bootstrap Docker config.

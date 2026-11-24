@@ -7,7 +7,8 @@ import os
 import pathlib
 import re
 import tempfile
-from catalog import catalog, one, ref, run, env, require, document, write, fail, bootstrap_target, checked_path
+from catalog import (catalog, one, ref, run, env, require, document, write, fail,
+                     bootstrap_target, checked_path, docker_config_path, job_builder_name)
 
 PROXIES = ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy')
 
@@ -26,6 +27,27 @@ def build_arguments():
     return args
 
 
+def initialize_builder():
+    name = job_builder_name()
+    config = docker_config_path()
+    config.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = config / 'buildx-builder'
+    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as output:
+        output.write(name + '\n')
+    command = ['docker', 'buildx', 'create', '--name', name, '--driver', 'docker-container']
+    for variable in PROXIES:
+        value = os.environ.get(variable)
+        if value:
+            # Buildx parses driver opts as CSV; quote the full key/value so a
+            # comma-delimited NO_PROXY remains one environment value.
+            option = '"env.' + variable + '=' + value.replace('"', '""') + '"'
+            command += ['--driver-opt', option]
+    run(command)
+    run(['docker', 'buildx', 'inspect', name, '--bootstrap'])
+    return name
+
+
 def validate(_):
     rows = catalog(bootstrap=bootstrap_target())
     print('Validated', len(rows), 'image entries:')
@@ -41,7 +63,9 @@ def build(args):
     tag = ('smoke-p' + require('ROOT_PIPELINE_ID')
            if fast else require('IMAGE_CANDIDATE_TAG'))
     reference = ref(row, tag)
-    command = ['docker', 'buildx', 'build', '--pull', '--progress=plain', '--platform', row['platform'],
+    builder = initialize_builder()
+    command = ['docker', 'buildx', 'build', '--builder', builder,
+               '--pull', '--progress=plain', '--platform', row['platform'],
                '-f', row['dockerfile'], '-t', reference,
                '--label', 'org.opencontainers.image.title=' + row['repository'],
                '--label', 'org.opencontainers.image.source=' + env('CI_PROJECT_URL'),
@@ -51,15 +75,15 @@ def build(args):
     if fast:
         command += ['--load']
     else:
-        # Inline cache works with the default Docker Buildx driver. The previous
-        # stable policy tag is imported as a registry cache source when present;
-        # a missing tag is treated by BuildKit as a cache miss, not a build error.
+        # Preserve the registry cache policy while using the job-scoped builder;
+        # a missing previous tag is treated by BuildKit as a cache miss.
         cache = ref(row, require('IMAGE_FINAL_TAG'))
         command += [
             '--push',
             '--cache-from', 'type=registry,ref=' + cache,
             '--cache-to', 'type=inline',
-            '--provenance=mode=max', '--sbom=true',
+            # max provenance records build-arg values; proxy args can contain credentials.
+            '--provenance=mode=min', '--sbom=true',
             '--metadata-file', str(metadata_file),
         ]
     command += build_arguments() + [row['context']]
@@ -113,7 +137,9 @@ def lock(_args):
         fail('Image chưa khai báo extension_lock')
     row = rows[name]
     local = 'sdwf-lock-' + require('ROOT_PIPELINE_ID') + '-' + name
-    run(['docker', 'buildx', 'build', '--load', '--pull', '--progress=plain', '--platform', row['platform'],
+    builder = initialize_builder()
+    run(['docker', 'buildx', 'build', '--builder', builder,
+         '--load', '--pull', '--progress=plain', '--platform', row['platform'],
          '--build-arg', 'EXTENSION_MODE=resolve', '-f', row['dockerfile'], '-t', local,
          *build_arguments(), row['context']])
     container = run(['docker', 'create', local], capture=True)

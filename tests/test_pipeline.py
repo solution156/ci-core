@@ -66,7 +66,8 @@ class PipelineTests(unittest.TestCase):
             'CI_PIPELINE_ID': '42', 'CI_COMMIT_SHA': 'a' * 40,
             'CI_CORE_PROJECT': 'group/ci-core', 'CI_CORE_REF': 'v2.0.0',
             'HARBOR_REGISTRY': 'registry.example.test', 'HARBOR_PROJECT': 'images',
-            'EXTENSION_BOOTSTRAP': '', 'ROOT_PIPELINE_ID': '42',
+            'EXTENSION_BOOTSTRAP': '', 'ROOT_PIPELINE_ID': '42', 'CI_JOB_ID': '12345',
+            'CI_PROJECT_DIR': str(self.root),
         }, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -220,7 +221,24 @@ class PipelineTests(unittest.TestCase):
             pipeline.build(args)
         self.assertTrue(Path('out/chrome/built.txt').is_file())
         self.assertRegex(Path('out/chrome/built.txt').read_text(), '@sha256:[a-f0-9]{64}')
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:3], ['docker', 'buildx', 'create'])
+        self.assertEqual(calls[1][:3], ['docker', 'buildx', 'inspect'])
+        self.assertEqual(calls[2][:3], ['docker', 'buildx', 'build'])
+
+    def test_smoke_build_uses_scoped_builder_and_load_output(self):
+        import pipeline
+        os.environ.update(IMAGE_ID='chrome', ROOT_PIPELINE_ID='42')
+        calls = []
+        with patch.object(pipeline, 'run', lambda cmd, capture=False: calls.append(cmd) or ''):
+            pipeline.build(type('Args', (), {'command': 'smoke', 'dry_run': False})())
+        self.assertEqual(calls[0][:3], ['docker', 'buildx', 'create'])
+        self.assertEqual(calls[1][:3], ['docker', 'buildx', 'inspect'])
+        build = calls[2]
+        self.assertIn('--builder', build)
+        self.assertIn('--load', build)
+        self.assertNotIn('--push', build)
+        self.assertNotIn('--provenance=mode=max', build)
+        self.assertNotIn('--sbom=true', build)
 
 
 if __name__ == '__main__':

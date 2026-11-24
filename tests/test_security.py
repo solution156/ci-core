@@ -46,6 +46,51 @@ class SecurityTests(fixtures.PipelineTests):
             with self.assertRaises(SystemExit):
                 job.main()
 
+    def test_cleanup_auth_removes_nested_job_files_and_is_idempotent(self):
+        os.environ['CI_PROJECT_DIR'] = str(self.root)
+        nested = self.root / '.docker-job' / 'buildx' / 'instances'
+        nested.mkdir(parents=True)
+        (nested / 'builder.json').write_text('{}')
+        (self.root / '.docker-job' / 'config.json').write_text('{}')
+        with patch.object(sys, 'argv', ['job.py', 'cleanup-auth']):
+            job.main()
+            job.main()
+        self.assertFalse((self.root / '.docker-job').exists())
+
+    def test_cleanup_auth_removes_only_its_job_builder_before_config(self):
+        os.environ['CI_PROJECT_DIR'] = str(self.root)
+        os.environ['DOCKER_CONFIG'] = str(self.root / '.docker-job')
+        config = self.root / '.docker-job'
+        config.mkdir()
+        (config / 'config.json').write_text('{}')
+        (config / 'buildx-builder').write_text('workspace-ci-' + os.environ['CI_JOB_ID'] + '\n')
+        calls = []
+        def fake_run(command, capture=False):
+            calls.append((command, config.exists()))
+            if command[2] == 'ls':
+                return 'workspace-ci-' + os.environ['CI_JOB_ID']
+            return ''
+        with patch.object(job, 'run', fake_run), patch.object(sys, 'argv', ['job.py', 'cleanup-auth']):
+            job.main()
+        self.assertEqual(calls[0][0][:4], ['docker', 'buildx', 'ls', '--format'])
+        self.assertEqual(calls[1][0][:3], ['docker', 'buildx', 'rm'])
+        self.assertTrue(calls[1][1])
+        self.assertFalse(config.exists())
+
+    def test_cleanup_auth_removes_credentials_but_reports_builder_cleanup_failure(self):
+        os.environ['CI_PROJECT_DIR'] = str(self.root)
+        config = self.root / '.docker-job'
+        config.mkdir()
+        (config / 'config.json').write_text('{}')
+        (config / 'buildx-builder').write_text('workspace-ci-' + os.environ['CI_JOB_ID'] + '\n')
+        def fail_builder(_command, capture=False):
+            raise RuntimeError('docker daemon unavailable')
+        with patch.object(job, 'run', fail_builder), patch.object(sys, 'argv', ['job.py', 'cleanup-auth']):
+            with self.assertRaisesRegex(RuntimeError, 'daemon unavailable'):
+                job.main()
+        self.assertFalse((config / 'config.json').exists())
+        self.assertTrue((config / 'buildx-builder').exists())
+
     def test_disabled_image_manual_selection_rejected(self):
         os.environ.update(CI_PIPELINE_SOURCE='web', IMAGE_SELECTION='vscode')
         with self.assertRaises(SystemExit):

@@ -99,7 +99,8 @@ class Contracts(PipelineTests):
     def test_production_build_uses_registry_cache_attestations_and_metadata_digest(self):
         self.full()
         os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-p42-' + os.environ['CI_COMMIT_SHA'][:12],
-                          IMAGE_FINAL_TAG='0.1.0-dev')
+                          IMAGE_FINAL_TAG='0.1.0-dev', HTTP_PROXY='http://proxy-user:secret@proxy.example.test:8080',
+                          NO_PROXY='harbor.example.test,localhost')
         commands = []
 
         def record(cmd, capture=False):
@@ -113,16 +114,36 @@ class Contracts(PipelineTests):
         args = type('Args', (), {'command': 'build', 'dry_run': False})()
         with patch.object(pipeline, 'run', record):
             pipeline.build(args)
-        build = commands[0]
+        builder = 'workspace-ci-' + os.environ['CI_JOB_ID']
+        self.assertEqual(commands[0][:5], ['docker', 'buildx', 'create', '--name', builder])
+        self.assertIn('--driver', commands[0])
+        self.assertIn('docker-container', commands[0])
+        self.assertIn('"env.HTTP_PROXY=http://proxy-user:secret@proxy.example.test:8080"', commands[0])
+        self.assertIn('"env.NO_PROXY=harbor.example.test,localhost"', commands[0])
+        self.assertEqual(commands[1], ['docker', 'buildx', 'inspect', builder, '--bootstrap'])
+        build = commands[2]
         self.assertIn('--push', build)
         self.assertNotIn('--load', build)
+        self.assertIn('--builder', build)
+        self.assertIn(builder, build)
         self.assertIn('--cache-from', build)
         self.assertIn('--cache-to', build)
-        self.assertIn('--provenance=mode=max', build)
+        self.assertIn('--provenance=mode=min', build)
+        self.assertNotIn('--provenance=mode=max', build)
         self.assertIn('--sbom=true', build)
         self.assertIn('--metadata-file', build)
         immutable = Path('out/chrome/built.txt').read_text().strip()
         self.assertEqual(immutable, 'registry.example.test/images/chrome@sha256:' + 'b' * 64)
+
+    def test_buildkit_proxy_values_are_redacted_from_command_log(self):
+        import catalog
+        output = io.StringIO()
+        with patch.object(catalog.subprocess, 'run') as run_command:
+            with contextlib.redirect_stdout(output):
+                catalog.run(['docker', 'buildx', 'create', '--driver-opt',
+                             '"env.HTTPS_PROXY=https://user:secret@proxy.example.test:8443"'])
+        self.assertNotIn('user:secret', output.getvalue())
+        self.assertIn('[REDACTED]', output.getvalue())
 
     def test_patch_without_fixes_still_records_pinned_digest(self):
         self.full()
