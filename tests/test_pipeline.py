@@ -18,6 +18,7 @@ WORKSPACE = CORE.parent / 'workspace-images'
 sys.path.insert(0, str(CORE / 'scripts'))
 import catalog
 import plan
+from catalog import checked_path
 
 
 class PipelineTests(unittest.TestCase):
@@ -124,6 +125,42 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(Path('out/vscode/extensions.lock').is_file())
         self.assertTrue(any(command[1] == 'cp' for command in calls))
         self.assertTrue(any(command[1] == 'rm' for command in calls))
+
+    def test_fast_smoke_resolves_runtime_check_when_lock_is_uninitialized(self):
+        import pipeline
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'vscode')['enabled'] = True
+        Path('images.json').write_text(json.dumps(data))
+        os.environ.update(IMAGE_ID='vscode', ROOT_PIPELINE_ID='42')
+        calls = []
+        def record(cmd, capture=False):
+            calls.append(cmd)
+            if cmd[1] == 'create':
+                return 'c' * 64
+            if cmd[1] == 'cp':
+                Path(cmd[-1]).write_text('fixture.extension@1.2.3\n')
+            return ''
+        with patch.object(pipeline, 'run', record), patch.object(pipeline, 'runtime_check') as runtime:
+            pipeline.build(type('Args', (), {'command': 'smoke', 'dry_run': False})())
+        runtime.assert_called_once()
+        self.assertEqual(runtime.call_args.args[2], 'resolve')
+
+    def test_runtime_check_resolves_when_lock_is_uninitialized(self):
+        import pipeline
+        data = json.loads(Path('images.json').read_text())
+        row = next(r for r in data['images'] if r['id'] == 'vscode')
+        script = checked_path(row['runtime_check']).read_text()
+        runs = []
+        def record(cmd, capture=False, **kwargs):
+            runs.append((cmd, kwargs.get('stdin').read()))
+            return ''
+        with patch.object(pipeline.subprocess, 'run', record), patch.object(pipeline, 'run'):
+            pipeline.runtime_check(row, 'registry.example.test/images/vscode:smoke-p42', 'resolve')
+        self.assertEqual(len(runs), 1)
+        command, stdin_content = runs[0]
+        self.assertIn('--build-arg', command)
+        self.assertIn('EXTENSION_MODE=resolve', command)
+        self.assertEqual(stdin_content, script.encode())
 
     def test_builder_network_driver_option_is_optional_and_validated(self):
         import pipeline

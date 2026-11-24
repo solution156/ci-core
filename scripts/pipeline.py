@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import tempfile
 from catalog import (catalog, one, ref, run, env, require, document, write, fail,
                      checked_path, docker_config_path, job_builder_name, lock_config)
@@ -100,7 +101,7 @@ def build(args):
     if fast:
         if resolve_lock:
             extract_extension_lock(row, reference)
-        runtime_check(row, reference)
+        runtime_check(row, reference, 'resolve' if resolve_lock else None)
         write(path(row['id'], 'smoke.json'), {'id': row['id'], 'result': 'pass', 'pushed': False})
         print('FAST local build/runtime OK; không push:', row['id'])
         return
@@ -143,14 +144,16 @@ def pushed_digest(reference):
     return immutable
 
 
-def runtime_check(row, reference):
+def runtime_check(row, reference, extension_mode=None):
     script = 'set -e; test "$(id -u)" = 1000; test -d /dockerstartup; test -d "$HOME"'
-    run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', '/bin/bash', reference, '-lc', script])
+    arguments = []
+    if extension_mode:
+        arguments += ['--build-arg', 'EXTENSION_MODE=' + extension_mode]
+    run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', '/bin/bash'] + arguments + [reference, '-lc', script])
     if row.get('runtime_check'):
         # Read a reviewed repository script and stream via stdin; no host mounts.
         with checked_path(row['runtime_check']).open('rb') as source:
-            import subprocess
-            subprocess.run(['docker', 'run', '--rm', '-i', '--network', 'none', '--entrypoint', '/bin/bash', reference, '-s'], stdin=source, check=True)
+            subprocess.run(['docker', 'run', '--rm', '-i', '--network', 'none', '--entrypoint', '/bin/bash'] + arguments + [reference, '-s'], stdin=source, check=True)
 
 
 def patch_candidates(report):
