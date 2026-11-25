@@ -80,6 +80,14 @@ class Contracts(PipelineTests):
                     self.assertIsInstance(command, str)
                     self.assertNotIn('docker system prune', command)
 
+    def test_verify_gate_scoped_to_fixable_os_packages(self):
+        cfg = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
+        script = cfg['.workspace-verify-trivy']['script'][0]
+        self.assertIn('--exit-code 1', script)
+        self.assertIn('--severity "$TRIVY_GATE_SEVERITY"', script)
+        self.assertIn('--pkg-types os', script)
+        self.assertIn('--ignore-unfixed', script)
+
     def test_dind_proxy_values_are_forwarded_without_hardcoded_urls(self):
         cfg = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
         service = cfg['.workspace-docker']['services'][0]

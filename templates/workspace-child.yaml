@@ -115,6 +115,7 @@ ci:tools:
       set -eu
       ref="$(cat "out/$IMAGE_ID/verified.txt")"
       trivy image --scanners vuln --severity "$TRIVY_GATE_SEVERITY" --exit-code 1 \
+        --pkg-types os --ignore-unfixed \
         --format json --output "out/$IMAGE_ID/verify.json" "$ref"
       test -s "out/$IMAGE_ID/verify.json"
   artifacts:

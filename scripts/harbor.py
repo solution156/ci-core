@@ -135,6 +135,25 @@ def assert_current_branch_tip():
         fail(f'{branch} đã thay đổi: từ chối promote pipeline cũ')
 
 
+# Only OS packages can be remediated by the patch stage. Language/package
+# findings are still reported in scan.json and SBOM, but must not block a
+# release when there is no pipeline-supported fix for them.
+GATE_PACKAGE_CLASS = 'os-pkgs'
+
+
+def gate_findings(report, severities):
+    """Return gated CVE IDs: OS packages only, with an available fix."""
+    findings = []
+    for block in report.get('Results') or []:
+        if block.get('Class') != GATE_PACKAGE_CLASS:
+            continue
+        for vulnerability in block.get('Vulnerabilities') or []:
+            if (vulnerability.get('Severity', '').upper() in severities and
+                    vulnerability.get('FixedVersion')):
+                findings.append(vulnerability.get('VulnerabilityID'))
+    return findings
+
+
 def ensure_verified(name, immutable):
     if file(name, 'verified.txt').read_text(encoding='utf-8').strip() != immutable:
         fail('Verified artifact không khớp')
@@ -147,10 +166,9 @@ def ensure_verified(name, immutable):
     severities = {x.strip().upper() for x in required('TRIVY_GATE_SEVERITY').split(',')}
     if not severities or not severities <= {'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'}:
         fail('TRIVY_GATE_SEVERITY không hợp lệ')
-    for block in checked.get('Results') or []:
-        for vulnerability in block.get('Vulnerabilities') or []:
-            if vulnerability.get('Severity', '').upper() in severities:
-                fail(f'{name} vẫn còn CVE {vulnerability.get("VulnerabilityID")}')
+    gated = gate_findings(checked, severities)
+    if gated:
+        fail(f'{name} vẫn còn CVE {gated[0]}')
     for part in ('scan.json', 'patch.json', 'sbom.cdx.json', 'build.json',
                  'evidence.json', 'provenance.json', 'summary.md'):
         if not file(name, part).is_file() or file(name, part).stat().st_size == 0:

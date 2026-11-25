@@ -129,6 +129,21 @@ class SecurityTests(fixtures.PipelineTests):
             self.assertEqual(request.get_method(), 'GET')
             self.assertIn('%2F', request.full_url)
 
+    def test_gate_ignores_language_package_findings(self):
+        report = {'Results': [
+            {'Class': 'os-pkgs', 'Vulnerabilities': [
+                {'VulnerabilityID': 'CVE-OS', 'Severity': 'CRITICAL', 'FixedVersion': '1.2'}]},
+            {'Class': 'lang-pkgs', 'Vulnerabilities': [
+                {'VulnerabilityID': 'CVE-NODE', 'Severity': 'CRITICAL', 'FixedVersion': '2.0'}]},
+        ]}
+        self.assertEqual(harbor.gate_findings(report, {'CRITICAL'}), ['CVE-OS'])
+        self.assertEqual(harbor.gate_findings(report, {'HIGH'}), [])
+
+    def test_gate_ignores_vulnerabilities_without_fix(self):
+        report = {'Results': [{'Class': 'os-pkgs', 'Vulnerabilities': [
+            {'VulnerabilityID': 'CVE-UNFIXED', 'Severity': 'CRITICAL'}]}]}
+        self.assertEqual(harbor.gate_findings(report, {'CRITICAL'}), [])
+
     def test_immutable_promotion_refuses_existing_other_digest(self):
         self.full()
         os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-test', IMAGE_FINAL_TAG='0.1.0',
