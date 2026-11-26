@@ -129,20 +129,64 @@ class SecurityTests(fixtures.PipelineTests):
             self.assertEqual(request.get_method(), 'GET')
             self.assertIn('%2F', request.full_url)
 
-    def test_gate_ignores_language_package_findings(self):
+    def test_gate_policy_uses_catalog_not_project_variables(self):
+        os.environ.update(GATE_PKG_TYPES='os', GATE_IGNORE_UNFIXED='true', TRIVY_GATE_SEVERITY='HIGH')
+        row = catalog.one('chrome')
+        self.assertEqual(harbor.gate_policy(row), catalog.security_gate(row))
+
+    def test_gate_job_ignores_ambient_weakening_variables(self):
+        os.environ.update(IMAGE_ID='chrome', GATE_PKG_TYPES='os', GATE_IGNORE_UNFIXED='true',
+                          TRIVY_GATE_SEVERITY='LOW')
+        catalog.write('out/chrome/verify.json', {'Results': [{
+            'Class': 'lang-pkgs', 'Vulnerabilities': [
+                {'VulnerabilityID': 'CVE-LIB-UNFIXED', 'Severity': 'CRITICAL'}]}]})
+        with self.assertRaisesRegex(SystemExit, 'CVE-LIB-UNFIXED'):
+            harbor.gate(None)
+
+    def test_gate_default_is_strict_all_classes_including_unfixed(self):
         report = {'Results': [
             {'Class': 'os-pkgs', 'Vulnerabilities': [
-                {'VulnerabilityID': 'CVE-OS', 'Severity': 'CRITICAL', 'FixedVersion': '1.2'}]},
+                {'VulnerabilityID': 'CVE-OS', 'Severity': 'CRITICAL'}]},
+            {'Class': 'lang-pkgs', 'Vulnerabilities': [
+                {'VulnerabilityID': 'CVE-NODE', 'Severity': 'CRITICAL'}]},
+        ]}
+        self.assertEqual(harbor.gate_findings(report, {'CRITICAL'}), ['CVE-OS', 'CVE-NODE'])
+
+    def test_gate_honors_explicit_pkg_types_and_ignore_unfixed(self):
+        report = {'Results': [
+            {'Class': 'os-pkgs', 'Vulnerabilities': [
+                {'VulnerabilityID': 'CVE-OS-FIXED', 'Severity': 'CRITICAL', 'FixedVersion': '1.2'},
+                {'VulnerabilityID': 'CVE-OS-UNFIXED', 'Severity': 'CRITICAL'}]},
             {'Class': 'lang-pkgs', 'Vulnerabilities': [
                 {'VulnerabilityID': 'CVE-NODE', 'Severity': 'CRITICAL', 'FixedVersion': '2.0'}]},
         ]}
-        self.assertEqual(harbor.gate_findings(report, {'CRITICAL'}), ['CVE-OS'])
-        self.assertEqual(harbor.gate_findings(report, {'HIGH'}), [])
+        self.assertEqual(harbor.gate_findings(report, {'CRITICAL'}, 'os', True), ['CVE-OS-FIXED'])
+        self.assertEqual(harbor.gate_findings(report, {'CRITICAL'}, 'os,library', False),
+                         ['CVE-OS-FIXED', 'CVE-OS-UNFIXED', 'CVE-NODE'])
 
-    def test_gate_ignores_vulnerabilities_without_fix(self):
-        report = {'Results': [{'Class': 'os-pkgs', 'Vulnerabilities': [
-            {'VulnerabilityID': 'CVE-UNFIXED', 'Severity': 'CRITICAL'}]}]}
-        self.assertEqual(harbor.gate_findings(report, {'CRITICAL'}), [])
+    def test_evidence_records_effective_gate_policy(self):
+        import release
+        self.full()
+        os.environ.update(IMAGE_ID='chrome', ROOT_PIPELINE_ID='42', CI_PIPELINE_ID='43',
+                          GATE_PKG_TYPES='os', GATE_IGNORE_UNFIXED='true', IMAGE_CANDIDATE_TAG='ci-p42-abc',
+                          CI_PROJECT_URL='https://gitlab.example.test/group/project', WORKSPACE_REF_KIND='main',
+                          TRIVY_SCAN_SEVERITY='HIGH,CRITICAL', TRIVY_GATE_SEVERITY='LOW')
+        base = catalog.ref(catalog.one('chrome'), 'ci-p42-abc')
+        immutable = base.rsplit(':', 1)[0] + '@sha256:' + 'b' * 64
+        Path('out/chrome').mkdir(parents=True, exist_ok=True)
+        Path('out/chrome/verified.txt').write_text(immutable + '\n')
+        catalog.write('out/chrome/build.json', {'candidate': base})
+        catalog.write('out/chrome/patch.json', {'candidate': base, 'status': 'patched', 'reference': immutable})
+        catalog.write('out/chrome/runtime.json', {'reference': immutable, 'result': 'pass'})
+        for part in ('scan.json', 'verify.json', 'sbom.cdx.json'):
+            catalog.write('out/chrome/' + part, {})
+        policy = catalog.security_policy_evidence(catalog.one('chrome'))
+        catalog.write('out/chrome/verify-policy.json', {
+            'image_id': 'chrome', 'policy': policy, 'result': 'pass', 'findings': []})
+        release.evidence(None)
+        evidence = catalog.document('out/chrome/evidence.json')
+        self.assertEqual(evidence['gate_policy'], policy)
+        self.assertIn('CRITICAL', Path('out/chrome/summary.md').read_text())
 
     def test_immutable_promotion_refuses_existing_other_digest(self):
         self.full()

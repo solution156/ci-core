@@ -6,10 +6,12 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import tempfile
 from catalog import (catalog, one, ref, run, env, require, document, write, fail,
-                     checked_path, docker_config_path, job_builder_name, lock_config)
+                     checked_path, docker_config_path, job_builder_name, lock_config, build_config,
+                     security_gate)
 
 PROXIES = ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy')
 
@@ -54,6 +56,26 @@ def initialize_builder():
     return name
 
 
+def write_gate_policies(_args):
+    """Emit per-image shell inputs from validated catalog policy, never CI variables."""
+    rows = catalog(strict_locks=env('PIPELINE_KIND') != 'fast')
+    destination = pathlib.Path('out/gate-policy')
+    destination.mkdir(parents=True, exist_ok=True)
+    for row in rows:
+        if not row['enabled']:
+            continue
+        policy = security_gate(row)
+        values = {
+            'POLICY_SEVERITY': policy['severity'],
+            'POLICY_PKG_TYPES': policy['pkg_types'],
+            'POLICY_IGNORE_UNFIXED': 'true' if policy['ignore_unfixed'] else 'false',
+            'POLICY_VEX_FILES': ' '.join(policy['vex_sources']),
+        }
+        script = ''.join(f'{key}={shlex.quote(value)}\n' for key, value in values.items())
+        (destination / f'{row["id"]}.sh').write_text(script, encoding='utf-8')
+    print('Generated catalog-owned gate policy files for enabled images.')
+
+
 def validate(_):
     rows = catalog(strict_locks=env('PIPELINE_KIND') != 'fast')
     print('Validated', len(rows), 'image entries:')
@@ -64,6 +86,7 @@ def validate(_):
 def build(args):
     fast = args.command == 'smoke'
     row = one(require('IMAGE_ID'), strict_locks=not fast)
+    build = build_config(row)
     resolve_lock = fast and bool(row.get('extension_lock')) and not lock_config(row, strict=False)
     if not fast and env('CI_COMMIT_REF_PROTECTED') != 'true':
         fail('Build push requires protected ref')
@@ -72,8 +95,8 @@ def build(args):
     reference = ref(row, tag)
     builder = initialize_builder()
     command = ['docker', 'buildx', 'build', '--builder', builder,
-               '--pull', '--progress=plain', '--platform', row['platform'],
-               '-f', row['dockerfile'], '-t', reference,
+               '--pull', '--progress=plain', '--platform', build['platform'],
+               '-f', build['dockerfile'], '-t', reference,
                '--label', 'org.opencontainers.image.title=' + row['repository'],
                '--label', 'org.opencontainers.image.source=' + env('CI_PROJECT_URL'),
                '--label', 'org.opencontainers.image.revision=' + env('CI_COMMIT_SHA'),
@@ -94,14 +117,19 @@ def build(args):
             '--metadata-file', str(metadata_file),
         ]
     command += build_arguments()
+    for key, value in sorted(build['args'].items()):
+        command += ['--build-arg', f'{key}={value}']
+    if build['target']:
+        command += ['--target', build['target']]
     if resolve_lock:
         command += ['--build-arg', 'EXTENSION_MODE=resolve']
-    command += [row['context']]
+    command += [build['context']]
     run(command)
     if fast:
         if resolve_lock:
             extract_extension_lock(row, reference)
-        runtime_check(row, reference, 'resolve' if resolve_lock else None)
+        runtime_check(row, reference,
+                      row['extension_lock']['generated'] if resolve_lock else None)
         write(path(row['id'], 'smoke.json'), {'id': row['id'], 'result': 'pass', 'pushed': False})
         print('FAST local build/runtime OK; không push:', row['id'])
         return
@@ -110,7 +138,8 @@ def build(args):
     write(path(row['id'], 'build.json'), {
         'reference': immutable,
         'id': row['id'], 'version': row['version'], 'commit': require('CI_COMMIT_SHA'),
-        'candidate': reference, 'dockerfile': row['dockerfile'], 'platform': row['platform'],
+        'candidate': reference, 'dockerfile': build['dockerfile'], 'context': build['context'],
+        'platform': build['platform'], 'target': build['target'], 'build_args': build['args'],
         'root_pipeline': require('ROOT_PIPELINE_ID'),
     })
 
@@ -144,11 +173,13 @@ def pushed_digest(reference):
     return immutable
 
 
-def runtime_check(row, reference, extension_mode=None):
+def runtime_check(row, reference, generated_lock=None):
     script = 'set -e; test "$(id -u)" = 1000; test -d /dockerstartup; test -d "$HOME"'
+    # docker run has no --build-arg; point the verifier at the lockfile generated
+    # by the resolve-mode build via EXTENSIONS_LOCK (read by verify-extensions.sh).
     arguments = []
-    if extension_mode:
-        arguments += ['--build-arg', 'EXTENSION_MODE=' + extension_mode]
+    if generated_lock:
+        arguments += ['--env', 'EXTENSIONS_LOCK=' + generated_lock]
     run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', '/bin/bash'] + arguments + [reference, '-lc', script])
     if row.get('runtime_check'):
         # Read a reviewed repository script and stream via stdin; no host mounts.
@@ -175,6 +206,7 @@ def patch_candidates(report):
 
 def patch(args):
     row = one(require('IMAGE_ID'))
+    build = build_config(row)
     name = row['id']
     info = document(path(name, 'build.json'))
     candidate = ref(row, require('IMAGE_CANDIDATE_TAG'))
@@ -204,7 +236,7 @@ def patch(args):
             instructions.append('USER ' + user)
         with tempfile.TemporaryDirectory(prefix='sdwf-patch-') as tmp:
             pathlib.Path(tmp, 'Dockerfile').write_text('\n'.join(instructions) + '\n', encoding='utf-8')
-            run(['docker', 'build', '--platform', row['platform'], '--progress=plain', '--pull=false',
+            run(['docker', 'build', '--platform', build['platform'], '--progress=plain', '--pull=false',
                  '-f', f'{tmp}/Dockerfile', '-t', candidate, *build_arguments(), tmp])
         run(['docker', 'push', candidate])
         final_reference = pushed_digest(candidate)
@@ -235,14 +267,15 @@ def runtime(_args):
 
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument('command', choices=('validate', 'smoke', 'build', 'patch', 'runtime'))
+    cli.add_argument('command', choices=('validate', 'gate-policy', 'smoke', 'build', 'patch', 'runtime'))
     cli.add_argument('--dry-run', action='store_true', help='Show intent only; no Docker/network/file mutations')
     args = cli.parse_args()
     if args.dry_run:
         print('DRY-RUN:', args.command, 'image=' + env('IMAGE_ID'), '(no commands executed)')
         return
     try:
-        {'validate': validate, 'smoke': build, 'build': build, 'patch': patch, 'runtime': runtime}[args.command](args)
+        {'validate': validate, 'gate-policy': write_gate_policies, 'smoke': build,
+         'build': build, 'patch': patch, 'runtime': runtime}[args.command](args)
     except (OSError, ValueError, KeyError) as exc:
         fail(str(exc))
 

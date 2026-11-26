@@ -48,10 +48,13 @@ def generate(output):
             build = job('build', '.workspace-build', row, ['ci:tools'])
             scan = job('scan', '.workspace-scan', row, [build])
             patch = job('patch', '.workspace-patch', row, ['ci:tools', build, scan])
-            verify = job('verify:trivy', '.workspace-verify-trivy', row, [patch])
+            verify_trivy = job('verify:trivy', '.workspace-verify-trivy', row, ['ci:tools', patch])
+            verify_policy = job('verify:policy', '.workspace-verify-policy', row,
+                                ['ci:tools', patch, verify_trivy])
             runtime = job('verify:runtime', '.workspace-verify-runtime', row, ['ci:tools', patch])
-            sbom = job('gen-sbom', '.workspace-sbom', row, [patch, verify, runtime])
-            evidence = job('evidence', '.workspace-evidence', row, ['ci:tools', build, scan, patch, verify, runtime, sbom])
+            sbom = job('gen-sbom', '.workspace-sbom', row, [patch, verify_policy, runtime])
+            evidence = job('evidence', '.workspace-evidence', row,
+                           ['ci:tools', build, scan, patch, verify_trivy, verify_policy, runtime, sbom])
             sign = job('sign', '.workspace-sign', row, [evidence])
             promote_needs = ['ci:tools', sign]
             if env('DEVGUARD_ENABLED', 'false').lower() == 'true':

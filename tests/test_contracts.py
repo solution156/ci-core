@@ -33,9 +33,11 @@ class Contracts(PipelineTests):
         expected_inputs = {
             'build': {'ci:tools'},
             'scan': {'build'}, 'patch': {'ci:tools', 'build', 'scan'},
-            'verify:runtime': {'ci:tools', 'patch'}, 'verify:trivy': {'patch'},
-            'gen-sbom': {'patch', 'verify:trivy', 'verify:runtime'},
-            'evidence': {'ci:tools', 'build', 'scan', 'patch', 'verify:trivy', 'verify:runtime', 'gen-sbom'},
+            'verify:trivy': {'ci:tools', 'patch'},
+            'verify:policy': {'ci:tools', 'patch', 'verify:trivy'},
+            'verify:runtime': {'ci:tools', 'patch'},
+            'gen-sbom': {'patch', 'verify:policy', 'verify:runtime'},
+            'evidence': {'ci:tools', 'build', 'scan', 'patch', 'verify:trivy', 'verify:policy', 'verify:runtime', 'gen-sbom'},
             'sign': {'evidence'}, 'promote': {'ci:tools', 'sign'}, 'cleanup': {'promote'},
         }
         for name, raw in generated.items():
@@ -70,9 +72,12 @@ class Contracts(PipelineTests):
 
     def test_scan_and_sbom_use_digest_files(self):
         cfg = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
+        verify = cfg['.workspace-verify-trivy']['script'][0]
+        gate = cfg['.workspace-verify-policy']['script'][0]
         self.assertIn('built.txt', cfg['.workspace-scan']['script'][0])
         self.assertIn('verified.txt', cfg['.workspace-sbom']['script'][0])
-        self.assertIn('--exit-code 1', cfg['.workspace-verify-trivy']['script'][0])
+        self.assertIn('--exit-code 0', verify)
+        self.assertIn('harbor.py gate', gate)
         self.assertIn('trivy image --format cyclonedx', cfg['.workspace-sbom']['script'][0])
         for job in cfg.values():
             if isinstance(job, dict):
@@ -80,13 +85,137 @@ class Contracts(PipelineTests):
                     self.assertIsInstance(command, str)
                     self.assertNotIn('docker system prune', command)
 
-    def test_verify_gate_scoped_to_fixable_os_packages(self):
+    def test_catalog_supports_per_image_build_context_platform_args_and_target(self):
+        import catalog
+        context = Path('build-context/custom')
+        context.mkdir(parents=True)
+        (context / 'Dockerfile').write_text('FROM alpine:3.21 AS runtime\nUSER 1000\n')
+        data = json.loads(Path('images.json').read_text())
+        data['images'].append({
+            'id': 'custom', 'repository': 'custom', 'version': '1.2.3', 'enabled': True,
+            'depends_on': [],
+            'build': {
+                'context': 'build-context/custom', 'dockerfile': 'Dockerfile',
+                'platform': 'linux/arm64', 'args': {'APP_VERSION': '1.2.3'}, 'target': 'runtime'
+            }
+        })
+        Path('images.json').write_text(json.dumps(data))
+        row = catalog.one('custom')
+        self.assertEqual(catalog.build_config(row), {
+            'context': 'build-context/custom', 'dockerfile': 'Dockerfile',
+            'platform': 'linux/arm64', 'args': {'APP_VERSION': '1.2.3'}, 'target': 'runtime'
+        })
+        with patch.object(catalog, 'base_changes', return_value=('base', ['build-context/custom/app.py'])):
+            selected, _ = catalog.changed_images(catalog.catalog(strict_locks=False))
+        self.assertEqual(selected, ['custom'])
+
+    def test_catalog_rejects_secret_like_build_arg_names(self):
+        import catalog
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'chrome')['build'] = {
+            'args': {'API_TOKEN': 'must-not-be-a-build-arg'}}
+        Path('images.json').write_text(json.dumps(data))
+        with self.assertRaisesRegex(SystemExit, 'secret'):
+            catalog.catalog()
+
+    def test_gate_policy_artifact_is_generated_from_catalog(self):
+        import pipeline
+        os.environ.update(PIPELINE_KIND='full', GATE_PKG_TYPES='os', GATE_IGNORE_UNFIXED='true')
+        pipeline.write_gate_policies(None)
+        source = Path('out/gate-policy/chrome.sh').read_text()
+        self.assertIn('POLICY_PKG_TYPES=os,library', source)
+        self.assertIn('POLICY_IGNORE_UNFIXED=false', source)
+        self.assertNotIn('GATE_PKG_TYPES', source)
+
+    def test_vex_source_must_be_explicit_and_is_digest_audited(self):
+        import catalog
+        vex_dir = Path('vex/chrome')
+        vex_dir.mkdir(parents=True)
+        vex = vex_dir / 'reviewed.openvex.json'
+        vex.write_text(json.dumps({
+            '@context': 'https://openvex.dev/ns/v0.2.0',
+            'statements': [{'vulnerability': 'CVE-2025-0001', 'status': 'not_affected',
+                            'justification': 'component_not_present', 'products': [{'@id': 'pkg:oci/chrome'}]}]
+        }))
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'chrome')['security_gate'] = {
+            'vex_sources': ['vex/chrome/reviewed.openvex.json'],
+            'justification': 'Reviewed VEX applies to a confirmed non-present component.',
+            'review_by': '2099-12-31'}
+        Path('images.json').write_text(json.dumps(data))
+        evidence = catalog.security_policy_evidence(catalog.one('chrome'))
+        self.assertEqual(evidence['vex_source_digests'][0]['path'], 'vex/chrome/reviewed.openvex.json')
+        self.assertRegex(evidence['vex_source_digests'][0]['sha256'], r'^sha256:[a-f0-9]{64}$')
+
+    def test_catalog_security_gate_defaults_to_strict(self):
+        import catalog
+        row = catalog.one('chrome')
+        gate = catalog.security_gate(row)
+        self.assertEqual(gate, {'severity': 'CRITICAL', 'pkg_types': 'os,library',
+                                'ignore_unfixed': False, 'vex_sources': [],
+                                'justification': '', 'review_by': ''})
+
+    def test_catalog_security_gate_accepts_explicit_exception(self):
+        import catalog
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'chrome')['security_gate'] = {
+            'pkg_types': 'os', 'ignore_unfixed': True,
+            'justification': 'Library vulnerabilities are reviewed outside this OS-only patch gate.',
+            'review_by': '2099-12-31'}
+        Path('images.json').write_text(json.dumps(data))
+        gate = catalog.security_gate(catalog.one('chrome'))
+        self.assertEqual(gate, {'severity': 'CRITICAL', 'pkg_types': 'os',
+                                'ignore_unfixed': True, 'vex_sources': [],
+                                'justification': 'Library vulnerabilities are reviewed outside this OS-only patch gate.',
+                                'review_by': '2099-12-31'})
+
+    def test_catalog_security_gate_rejects_unknown_pkg_type(self):
+        import catalog
+        data = json.loads(Path('images.json').read_text())
+        next(r for r in data['images'] if r['id'] == 'chrome')['security_gate'] = {
+            'pkg_types': 'os,bogus'}
+        Path('images.json').write_text(json.dumps(data))
+        with self.assertRaisesRegex(SystemExit, 'security_gate'):
+            catalog.catalog()
+
+    def test_plan_does_not_emit_security_policy_variables(self):
+        import plan
+        self.full()
+        os.environ.update(CI_PIPELINE_SOURCE='web', IMAGE_SELECTION='chrome')
+        plan.generate('generated.yml')
+        data = yaml.safe_load(Path('generated.yml').read_text())
+        for name in ('verify:trivy:chrome', 'verify:policy:chrome', 'promote:chrome'):
+            self.assertFalse(any(key.startswith('GATE_') for key in data[name].get('variables', {})))
+        self.assertIn('ci:tools', {need['job'] for need in data['verify:trivy:chrome']['needs']})
+        self.assertIn('verify:trivy:chrome', {need['job'] for need in data['verify:policy:chrome']['needs']})
+
+    def test_verify_gate_uses_catalog_policy_artifact(self):
         cfg = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
-        script = cfg['.workspace-verify-trivy']['script'][0]
-        self.assertIn('--exit-code 1', script)
-        self.assertIn('--severity "$TRIVY_GATE_SEVERITY"', script)
-        self.assertIn('--pkg-types os', script)
-        self.assertIn('--ignore-unfixed', script)
+        scan = cfg['.workspace-verify-trivy']['script'][0]
+        gate = cfg['.workspace-verify-policy']['script'][0]
+        self.assertIn('out/gate-policy/$IMAGE_ID.sh', scan)
+        self.assertIn('POLICY_VEX_FILES', scan)
+        self.assertIn('harbor.py gate', gate)
+        self.assertNotIn('GATE_PKG_TYPES', scan)
+        self.assertNotIn('GATE_IGNORE_UNFIXED', scan)
+        self.assertNotIn('TRIVY_GATE_SEVERITY', scan)
+
+    def test_run_redacts_proxy_values_but_shows_network_driver_opt(self):
+        import catalog
+        os.environ['BUILDX_BUILDER_NETWORK'] = ''  # value passed directly below
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), patch.object(catalog.subprocess, 'run'):
+            catalog.run(['docker', 'buildx', 'create',
+                         '--driver-opt', 'network=host',
+                         '--driver-opt', '"env.HTTPS_PROXY=http://proxy.invalid:3128"'])
+        printed = out.getvalue()
+        self.assertIn('network=host', printed)
+        self.assertNotIn('proxy.invalid', printed)
+        self.assertIn('env.HTTPS_PROXY=[REDACTED]', printed)
+
+    def test_common_yaml_has_no_hardcoded_builder_network_default(self):
+        cfg = (CORE / 'templates/common.yaml').read_text()
+        self.assertNotIn('BUILDX_BUILDER_NETWORK:', cfg)
 
     def test_dind_proxy_values_are_forwarded_without_hardcoded_urls(self):
         cfg = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())

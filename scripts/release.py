@@ -8,7 +8,7 @@ import pathlib
 import urllib.error
 import urllib.request
 import urllib.parse
-from catalog import one, env, require, ref, document, write, fail
+from catalog import one, env, require, ref, document, write, fail, security_policy_evidence
 
 
 def file(name, part):
@@ -28,10 +28,14 @@ def evidence(_args):
     if (build.get('candidate') != candidate or patch.get('candidate') != candidate or
             runtime.get('reference') != immutable or runtime.get('result') != 'pass'):
         fail('Build/patch/runtime không khớp immutable digest')
-    for part in ('scan.json', 'verify.json', 'sbom.cdx.json'):
+    for part in ('scan.json', 'verify.json', 'verify-policy.json', 'sbom.cdx.json'):
         if not file(name, part).is_file() or not file(name, part).stat().st_size:
             fail(f'Thiếu evidence: {part}')
         document(file(name, part))
+    gate_policy = security_policy_evidence(row)
+    expected_gate = {'image_id': name, 'policy': gate_policy, 'result': 'pass', 'findings': []}
+    if document(file(name, 'verify-policy.json')) != expected_gate:
+        fail('Security gate result không khớp catalog hoặc VEX source digest')
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     core_source = require('CI_PROJECT_URL')
     commit = require('CI_COMMIT_SHA')
@@ -42,7 +46,8 @@ def evidence(_args):
         'root_pipeline_id': root_id, 'child_pipeline_id': require('CI_PIPELINE_ID'),
         'pipeline_kind': require('WORKSPACE_REF_KIND'), 'generated_at': now,
         'scan_severity': require('TRIVY_SCAN_SEVERITY'),
-        'gate_severity': require('TRIVY_GATE_SEVERITY'),
+        'gate_severity': gate_policy['severity'],
+        'gate_policy': gate_policy,
     }
     write(file(name, 'evidence.json'), manifest)
     # SLSA v1 predicate, Cosign ghép predicate vào in-toto statement với subject digest.
@@ -52,7 +57,9 @@ def evidence(_args):
             'externalParameters': {
                 'source': {'uri': core_source, 'commit': commit},
                 'imageId': name, 'version': row['version'],
-                'dockerfile': row['dockerfile'], 'candidate': candidate,
+                'dockerfile': build.get('dockerfile'), 'context': build.get('context'),
+                'platform': build.get('platform'), 'target': build.get('target'),
+                'buildArgs': build.get('build_args', {}), 'candidate': candidate,
             },
             'internalParameters': {'rootPipelineId': root_id},
             'resolvedDependencies': [{'uri': 'git+' + core_source,
@@ -64,33 +71,24 @@ def evidence(_args):
         },
     }
     write(file(name, 'provenance.json'), provenance)
-    # OpenVEX chỉ từ tài liệu đã review. Không bao giờ tự suy đoán not_affected.
-    vex_dir = pathlib.Path('vex') / name
-    if vex_dir.is_dir():
-        statements = []
-        for source in sorted(vex_dir.glob('*.openvex.json')):
-            src = document(source)
-            if not str(src.get('@context', '')).startswith('https://openvex.dev/ns/'):
-                fail(f'{name}: ngữ cảnh OpenVEX không hợp lệ: {source}')
-            for record in src.get('statements', []):
-                if not record.get('vulnerability') or not record.get('status') or not record.get('products'):
-                    fail(f'{name}: OpenVEX statement không đầy đủ: {source}')
-                if record['status'] == 'not_affected' and not (record.get('justification') or record.get('impact_statement')):
-                    fail(f'{name}: không được tự công bố not_affected thiếu justification')
-                statements.append(record)
-        if list(vex_dir.glob('*.openvex.json')) and not statements:
-            fail(f'{name}: có tài liệu OpenVEX nhưng không có statement')
-        if statements:
-            write(file(name, 'vex.openvex.json'), {
-                '@context': 'https://openvex.dev/ns/v0.2.0',
-                '@id': env('CI_PIPELINE_URL') + '/openvex/' + name,
-                'author': env('CI_PROJECT_PATH'), 'timestamp': now,
-                'version': 1, 'statements': statements,
-            })
+    # Only VEX documents explicitly named by the catalog policy are emitted.
+    statements = []
+    for source in gate_policy['vex_sources']:
+        src = document(source)
+        statements.extend(src['statements'])
+    if statements:
+        write(file(name, 'vex.openvex.json'), {
+            '@context': 'https://openvex.dev/ns/v0.2.0',
+            '@id': env('CI_PIPELINE_URL') + '/openvex/' + name,
+            'author': env('CI_PROJECT_PATH'), 'timestamp': now,
+            'version': 1, 'statements': statements,
+        })
     summary = [f'# Phát hành {name} v{row["version"]}', '',
                f'- Image digest: `{immutable}`', f'- Commit: `{commit}`',
                f'- Parent pipeline: `{root_id}`', f'- Git ref: `{env("CI_COMMIT_TAG") or env("CI_COMMIT_BRANCH")}`',
-               f'- Trivy severity gate: `{require("TRIVY_GATE_SEVERITY")}`',
+               f'- Gate: severity=`{gate_policy["severity"]}`, pkg_types=`{gate_policy["pkg_types"]}`, '
+               f'ignore_unfixed=`{str(gate_policy["ignore_unfixed"]).lower()}`',
+               f'- VEX source digests: `{gate_policy["vex_source_digests"]}`',
                f'- OS patch: `{patch["status"]}`',
                '- Đã kiểm thử container dưới USER 1000 và các thư mục Kasm cơ bản.',
                '- Kết quả kiểm thử này **không thay thế** UAT trình duyệt/GUI thực tế.', '']

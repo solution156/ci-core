@@ -13,9 +13,7 @@ variables:
   TRIVY_SKIP_VERSION_CHECK: "true"
   TRIVY_IMAGE_SRC: "remote"
   DEVGUARD_ENABLED: "false"
-  BUILDX_BUILDER_NETWORK: ""
   TRIVY_SCAN_SEVERITY: "HIGH,CRITICAL"
-  TRIVY_GATE_SEVERITY: "CRITICAL"
   TRIVY_PATCH_SEVERITY: "HIGH,CRITICAL"
   AUTO_PATCH_OS: "true"
   PATCH_PACKAGE_EXCLUDE: "google-chrome-stable firefox firefox-esr opera-stable microsoft-edge-stable"
@@ -37,6 +35,7 @@ variables:
       test -f .ci-tools/scripts/pipeline.py
       # Do not artifact credentials, credential helper state or repository config.
       python3 -c 'import shutil; shutil.rmtree(".ci-tools/.git")'
+      python3 .ci-tools/scripts/pipeline.py gate-policy
   artifacts:
     expire_in: 2 days
-    paths: [.ci-tools/]
+    paths: [.ci-tools/, out/gate-policy/]

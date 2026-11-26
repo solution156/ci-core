@@ -66,12 +66,12 @@ ENV HOME=/home/local
 WORKDIR /home/local
 USER 1000
 ''')
+        (folder / '.dockerignore').write_text('')
         (work / '.dockerignore').write_text('.docker-job\nout\n')
-        (work / 'images.json').write_text(json.dumps({'schema_version': 2, 'images': [{'id': 'fixture', 'repository': 'fixture', 'context': '.', 'dockerfile': 'images/fixture/Dockerfile', 'platform': 'linux/amd64', 'enabled': True, 'version': '0.1.0', 'depends_on': []}]}))
-        run('fixture-git-init', ['git', 'init', '-q'], cwd=work)
-        run('fixture-git-add', ['git', 'add', '.'], cwd=work)
-        run('fixture-git-commit', ['git', '-c', 'user.name=Local integration', '-c', 'user.email=local@example.test', 'commit', '-qm', 'Synthetic integration fixture, not production source'], cwd=work)
-        sha = run('fixture-git-sha', ['git', 'rev-parse', 'HEAD'], cwd=work)
+        (work / 'images.json').write_text(json.dumps({'schema_version': 2, 'images': [{'id': 'fixture', 'repository': 'fixture', 'build': {'context': 'images/fixture', 'dockerfile': 'Dockerfile', 'platform': 'linux/amd64'}, 'enabled': True, 'version': '0.1.0', 'depends_on': []}]}))
+        sha = 'a' * 40
+        env.update(CI_JOB_ID=runid, CI_PROJECT_DIR=str(work), DOCKER_CONFIG=str(work / '.docker-job'),
+                   BUILDX_BUILDER_NETWORK='host')
         env.update(IMAGE_ID='fixture', IMAGE_CANDIDATE_TAG='ci-local-' + runid,
                    IMAGE_FINAL_TAG='0.1.0-dev',
                    ROOT_PIPELINE_ID=runid, CI_PIPELINE_ID=runid, CI_COMMIT_SHA=sha,

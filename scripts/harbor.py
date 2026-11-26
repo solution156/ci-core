@@ -16,7 +16,8 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
-from catalog import one, ref, document, write, require, env, fail as catalog_fail
+from catalog import (one, ref, document, write, require, env, fail as catalog_fail,
+                     security_gate, security_policy_evidence)
 
 
 def fail(message):
@@ -135,23 +136,51 @@ def assert_current_branch_tip():
         fail(f'{branch} đã thay đổi: từ chối promote pipeline cũ')
 
 
-# Only OS packages can be remediated by the patch stage. Language/package
-# findings are still reported in scan.json and SBOM, but must not block a
-# release when there is no pipeline-supported fix for them.
-GATE_PACKAGE_CLASS = 'os-pkgs'
+# Gate policy comes from the catalog via planner job variables. Default is strict:
+# all package classes, unfixed findings included. Only an explicit per-image
+# exception in images.json may relax it.
+PKGS_TO_CLASS = {'os': 'os-pkgs', 'library': 'lang-pkgs'}
 
 
-def gate_findings(report, severities):
-    """Return gated CVE IDs: OS packages only, with an available fix."""
+def gate_findings(report, severities, pkg_types='os,library', ignore_unfixed=False):
+    """Return gated CVE IDs using the image's effective Trivy gate policy."""
+    classes = {PKGS_TO_CLASS[p.strip()] for p in pkg_types.split(',') if p.strip() in PKGS_TO_CLASS}
     findings = []
     for block in report.get('Results') or []:
-        if block.get('Class') != GATE_PACKAGE_CLASS:
+        if block.get('Class') not in classes:
             continue
         for vulnerability in block.get('Vulnerabilities') or []:
-            if (vulnerability.get('Severity', '').upper() in severities and
-                    vulnerability.get('FixedVersion')):
-                findings.append(vulnerability.get('VulnerabilityID'))
+            if vulnerability.get('Severity', '').upper() not in severities:
+                continue
+            if ignore_unfixed and not vulnerability.get('FixedVersion'):
+                continue
+            findings.append(vulnerability.get('VulnerabilityID'))
     return findings
+
+
+def gate_policy(row):
+    """The catalog is the only source of security-gate policy."""
+    return security_gate(row)
+
+
+def check_gate_report(name, policy):
+    checked = document(file(name, 'verify.json'))
+    severities = {value for value in policy['severity'].split(',')}
+    gated = gate_findings(checked, severities, policy['pkg_types'], policy['ignore_unfixed'])
+    if gated:
+        fail(f'{name} vẫn còn CVE {gated[0]}')
+    return gated
+
+
+def gate(_args):
+    name = required('IMAGE_ID')
+    row = one(name)
+    policy = gate_policy(row)
+    check_gate_report(name, policy)
+    result = {'image_id': name, 'policy': security_policy_evidence(row),
+              'result': 'pass', 'findings': []}
+    write(file(name, 'verify-policy.json'), result)
+    print('Security gate OK:', name, policy['severity'], policy['pkg_types'])
 
 
 def ensure_verified(name, immutable):
@@ -162,13 +191,13 @@ def ensure_verified(name, immutable):
     runtime = document(file(name, 'runtime.json'))
     if runtime != {'id': name, 'reference': immutable, 'result': 'pass'}:
         fail('Runtime gate không đạt')
-    checked = document(file(name, 'verify.json'))
-    severities = {x.strip().upper() for x in required('TRIVY_GATE_SEVERITY').split(',')}
-    if not severities or not severities <= {'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'}:
-        fail('TRIVY_GATE_SEVERITY không hợp lệ')
-    gated = gate_findings(checked, severities)
-    if gated:
-        fail(f'{name} vẫn còn CVE {gated[0]}')
+    row = one(name)
+    policy = gate_policy(row)
+    check_gate_report(name, policy)
+    expected_policy = {'image_id': name, 'policy': security_policy_evidence(row),
+                       'result': 'pass', 'findings': []}
+    if document(file(name, 'verify-policy.json')) != expected_policy:
+        fail('Security gate artifact không khớp images.json hoặc VEX source digest')
     for part in ('scan.json', 'patch.json', 'sbom.cdx.json', 'build.json',
                  'evidence.json', 'provenance.json', 'summary.md'):
         if not file(name, part).is_file() or file(name, part).stat().st_size == 0:
@@ -176,6 +205,8 @@ def ensure_verified(name, immutable):
     evidence = document(file(name, 'evidence.json'))
     if evidence.get('reference') != immutable or evidence.get('image_id') != name:
         fail('Evidence JSON khác digest được ký')
+    if evidence.get('gate_policy') != expected_policy['policy']:
+        fail('Evidence gate policy không khớp catalog')
 
 
 def promote(_args):
@@ -223,13 +254,13 @@ def promote(_args):
 
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument('command', choices=('snapshot', 'promote'))
+    cli.add_argument('command', choices=('snapshot', 'gate', 'promote'))
     cli.add_argument('--dry-run', action='store_true', help='No API calls or file writes')
     args = cli.parse_args()
     if args.dry_run:
         print('DRY-RUN Harbor', args.command, 'image=' + env('IMAGE_ID'))
         return
-    {'snapshot': snapshot, 'promote': promote}[args.command](args)
+    {'snapshot': snapshot, 'gate': gate, 'promote': promote}[args.command](args)
 
 
 if __name__ == '__main__':

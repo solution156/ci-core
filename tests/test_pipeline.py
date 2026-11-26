@@ -143,24 +143,26 @@ class PipelineTests(unittest.TestCase):
         with patch.object(pipeline, 'run', record), patch.object(pipeline, 'runtime_check') as runtime:
             pipeline.build(type('Args', (), {'command': 'smoke', 'dry_run': False})())
         runtime.assert_called_once()
-        self.assertEqual(runtime.call_args.args[2], 'resolve')
+        generated = runtime.call_args.args[2]
+        self.assertEqual(generated, '/opt/dwf-vscode/extensions.lock.generated')
 
-    def test_runtime_check_resolves_when_lock_is_uninitialized(self):
+    def test_runtime_check_points_to_generated_lock_with_docker_run_env(self):
         import pipeline
         data = json.loads(Path('images.json').read_text())
         row = next(r for r in data['images'] if r['id'] == 'vscode')
-        script = checked_path(row['runtime_check']).read_text()
         runs = []
         def record(cmd, capture=False, **kwargs):
-            runs.append((cmd, kwargs.get('stdin').read()))
+            runs.append(cmd)
             return ''
-        with patch.object(pipeline.subprocess, 'run', record), patch.object(pipeline, 'run'):
-            pipeline.runtime_check(row, 'registry.example.test/images/vscode:smoke-p42', 'resolve')
-        self.assertEqual(len(runs), 1)
-        command, stdin_content = runs[0]
-        self.assertIn('--build-arg', command)
-        self.assertIn('EXTENSION_MODE=resolve', command)
-        self.assertEqual(stdin_content, script.encode())
+        with patch.object(pipeline, 'run', record), patch.object(pipeline.subprocess, 'run', record):
+            pipeline.runtime_check(row, 'registry.example.test/images/vscode:smoke-p42',
+                                   '/opt/dwf-vscode/extensions.lock.generated')
+        self.assertEqual(len(runs), 2)
+        for command in runs:
+            self.assertEqual(command[:2], ['docker', 'run'])
+            self.assertNotIn('--build-arg', command)
+            self.assertIn('--env', command)
+            self.assertIn('EXTENSIONS_LOCK=/opt/dwf-vscode/extensions.lock.generated', command)
 
     def test_builder_network_driver_option_is_optional_and_validated(self):
         import pipeline
@@ -331,6 +333,27 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(calls[0][:3], ['docker', 'buildx', 'create'])
         self.assertEqual(calls[1][:3], ['docker', 'buildx', 'inspect'])
         self.assertEqual(calls[2][:3], ['docker', 'buildx', 'build'])
+
+    def test_smoke_build_honors_per_image_build_settings(self):
+        import pipeline
+        data = json.loads(Path('images.json').read_text())
+        dockerfile = Path('images/chrome/Dockerfile')
+        lines = dockerfile.read_text().splitlines()
+        index = next(i for i, line in enumerate(lines) if line.startswith('FROM '))
+        lines[index] += ' AS runtime'
+        dockerfile.write_text(chr(10).join(lines) + chr(10))
+        next(r for r in data['images'] if r['id'] == 'chrome')['build'] = {
+            'platform': 'linux/arm64', 'args': {'APP_VERSION': '1.2.3'}, 'target': 'runtime'}
+        Path('images.json').write_text(json.dumps(data))
+        os.environ.update(IMAGE_ID='chrome', ROOT_PIPELINE_ID='42')
+        calls = []
+        with patch.object(pipeline, 'run', lambda cmd, capture=False: calls.append(cmd) or ''), \
+             patch.object(pipeline, 'runtime_check'):
+            pipeline.build(type('Args', (), {'command': 'smoke', 'dry_run': False})())
+        build = next(command for command in calls if command[1:3] == ['buildx', 'build'])
+        self.assertEqual(build[build.index('--platform') + 1], 'linux/arm64')
+        self.assertEqual(build[build.index('--target') + 1], 'runtime')
+        self.assertIn('APP_VERSION=1.2.3', build)
 
     def test_smoke_build_uses_scoped_builder_and_load_output(self):
         import pipeline

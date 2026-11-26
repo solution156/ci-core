@@ -114,14 +114,31 @@ ci:tools:
     - |
       set -eu
       ref="$(cat "out/$IMAGE_ID/verified.txt")"
-      trivy image --scanners vuln --severity "$TRIVY_GATE_SEVERITY" --exit-code 1 \
-        --pkg-types os --ignore-unfixed \
-        --format json --output "out/$IMAGE_ID/verify.json" "$ref"
+      policy="out/gate-policy/$IMAGE_ID.sh"
+      test -s "$policy"
+      # Source the catalog-generated policy artifact, not overridable CI variables.
+      . "$policy"
+      set -- --scanners vuln --pkg-types os,library --ignore-unfixed=false --ignorefile /dev/null --exit-code 0 --format json --output "out/$IMAGE_ID/verify.json"
+      for f in $POLICY_VEX_FILES; do
+        test -s "$f"
+        set -- "$@" --vex "$f"
+      done
+      trivy image "$@" "$ref"
       test -s "out/$IMAGE_ID/verify.json"
   artifacts:
     when: always
     expire_in: 7 days
     paths: ['out/$IMAGE_ID/verify.json']
+
+.workspace-verify-policy:
+  image: $PYTHON_IMAGE
+  stage: verify
+  script:
+    - python3 .ci-tools/scripts/harbor.py gate
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths: ['out/$IMAGE_ID/verify-policy.json']
 
 .workspace-verify-runtime:
   extends: .workspace-docker

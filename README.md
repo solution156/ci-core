@@ -88,12 +88,12 @@ Trong `workspace-images/.gitlab-ci.yml`:
 ```yaml
 include:
   - project: <namespace>/ci-core
-    ref: v2.2.0
+    ref: <tag-đã-publish>
     file: /templates/workspace-parent.yaml
 
 variables:
   CI_CORE_PROJECT: "<namespace>/ci-core"
-  CI_CORE_REF: "v2.2.0"
+  CI_CORE_REF: "<phải-trùng-ref-ở-include>"
 ```
 
 `CI_CORE_REF` phải khớp `ref`.
