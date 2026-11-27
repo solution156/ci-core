@@ -18,6 +18,19 @@ import release
 
 class Contracts(PipelineTests):
     # Reuse repository fixture but not inherited test methods.
+    def test_catalog_accepts_common_user_directive_spellings(self):
+        for spelling in ('USER 1000:1000', 'USER 1000 # comment', 'USER kasm-user'):
+            with self.subTest(spelling=spelling):
+                dockerfile = Path('images/chrome/Dockerfile')
+                original = dockerfile.read_text()
+                dockerfile.write_text(original.replace('USER 1000', spelling))
+                try:
+                    catalog.catalog()
+                except SystemExit as exc:
+                    self.fail(f'{spelling} rejected: {exc}')
+                finally:
+                    dockerfile.write_text(original)
+
     def test_release_uses_local_gate_and_one_publish_job(self):
         self.full()
         import plan
