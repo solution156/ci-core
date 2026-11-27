@@ -43,11 +43,14 @@ class PipelineTests(unittest.TestCase):
                 rows.append({'id': name, 'repository': name, 'context': '.', 'dockerfile': f'images/{name}/Dockerfile',
                              'platform': 'linux/amd64', 'enabled': name != 'vscode', 'version': '0.1.0', 'depends_on': deps})
             config = self.root / 'images/vscode/configs'
-            config.mkdir()
+            config.mkdir(parents=True)
             (config / 'extensions.txt').write_text('fixture.extension\n')
             (config / 'extensions.lock').write_text('# uninitialized fixture\n')
+            (self.root / 'images/vscode/validate').mkdir(parents=True)
+            (self.root / 'images/vscode/validate/runtime.sh').write_text('#!/bin/sh\ntrue\n')
             rows[-1]['extension_lock'] = {'manifest': 'images/vscode/configs/extensions.txt',
                 'lock': 'images/vscode/configs/extensions.lock', 'generated': '/opt/dwf-vscode/extensions.lock.generated'}
+            rows[-1]['runtime_check'] = 'images/vscode/validate/runtime.sh'
             shared = self.root / 'shared/browser'
             shared.mkdir(parents=True)
             (shared / 'cleanup.sh').write_text('#!/bin/sh\ntrue\n')
