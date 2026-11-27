@@ -1,12 +1,10 @@
 # Shared defaults; both pipelines include this from the same pinned ci-core ref.
 variables:
-  PYTHON_IMAGE: "rd-harbor-secops.servicemicro.net/build/ci-tools:v1"
+  PYTHON_IMAGE: "python:3.12-alpine"
   SHELL_IMAGE: "alpine:3.21"
   DOCKER_CLI_IMAGE: "docker:27.5.1-cli"
   DIND_IMAGE: "docker:27.5.1-dind"
-  TRIVY_IMAGE: "rd-harbor-secops.servicemicro.net/build/trivy:0.67.2"
-  COSIGN_IMAGE: "rd-harbor-secops.servicemicro.net/build/cosign:v2.4.1-dev"
-  DEVGUARD_SCANNER_IMAGE: "rd-harbor-secops.servicemicro.net/build/devguard-scanner:v1.16.0"
+  TRIVY_IMAGE: "aquasec/trivy:0.67.2"
   HEAVY_RESOURCE_GROUP: "workspace-heavy"
   GIT_DEPTH: "0"
   TRIVY_NO_PROGRESS: "true"
@@ -22,7 +20,7 @@ variables:
   image: $PYTHON_IMAGE
   before_script:
     - command -v python3
-    - command -v git
+    - command -v git >/dev/null || apk add --no-cache git
   script:
     - |
       set -eu
@@ -35,7 +33,6 @@ variables:
       test -f .ci-tools/scripts/pipeline.py
       # Do not artifact credentials, credential helper state or repository config.
       python3 -c 'import shutil; shutil.rmtree(".ci-tools/.git")'
-      python3 .ci-tools/scripts/pipeline.py gate-policy
   artifacts:
     expire_in: 2 days
-    paths: [.ci-tools/, out/gate-policy/]
+    paths: [.ci-tools/]

@@ -235,6 +235,18 @@ def build_config(row):
             'args': normalized_args, 'target': target}
 
 
+def runtime_config(row):
+    raw = row.get('runtime', {})
+    if not isinstance(raw, dict) or not set(raw) <= {'uid', 'shell', 'require_kasm'}:
+        fail('runtime chỉ nhận uid, shell và require_kasm')
+    uid, shell, kasm = raw.get('uid', 1000), raw.get('shell', '/bin/bash'), raw.get('require_kasm', True)
+    if type(uid) is not int or not 1 <= uid <= 2147483647:
+        fail('runtime.uid phải là UID non-root')
+    if shell not in ('/bin/sh', '/bin/bash') or type(kasm) is not bool:
+        fail('runtime.shell hoặc runtime.require_kasm không hợp lệ')
+    return uid, shell, kasm
+
+
 def catalog(strict_locks=True):
     source = document('images.json')
     if source.get('schema_version') != 2 or not isinstance(source.get('images'), list):
@@ -263,8 +275,9 @@ def catalog(strict_locks=True):
             fail(f'{name}: Dockerfile thiếu hoặc nằm ngoài build context')
         lines = dockerfile.read_text(encoding="utf-8").replace(chr(92) + chr(10), " " ).splitlines()
         users = [x.strip() for x in lines if x.startswith('USER ')]
-        if not any(x.startswith('FROM ') for x in lines) or not users or users[-1] != 'USER 1000':
-            fail(f'{name}: Dockerfile thiếu FROM hoặc USER 1000 cuối')
+        uid, _, _ = runtime_config(row)
+        if not any(x.startswith('FROM ') for x in lines) or not users or users[-1] != f'USER {uid}':
+            fail(f'{name}: Dockerfile thiếu FROM hoặc USER {uid} cuối')
         stage_names = []
         for line in lines:
             if line.startswith('FROM '):
@@ -420,10 +433,27 @@ def changed_images(rows):
     return selected, 'git-diff'
 
 
+def pipeline_mode():
+    prefix = 'PARENT_' if env('CI_PIPELINE_SOURCE') == 'parent_pipeline' else 'CI_'
+    branch, tag, src = (env(prefix + key) for key in ('COMMIT_BRANCH', 'COMMIT_TAG', 'PIPELINE_SOURCE'))
+    protected = env(prefix + ('REF_PROTECTED' if prefix == 'PARENT_' else 'COMMIT_REF_PROTECTED')) == 'true'
+    if src == 'merge_request_event':
+        mode = 'fast'
+    elif tag and src == 'push' and protected and RELEASE_TAG.fullmatch(tag):
+        mode = 'release'
+    elif not tag and src in ('push', 'web') and protected and (branch == 'main' or RELEASE_BRANCH.fullmatch(branch)):
+        mode = 'full'
+    elif not tag and src in ('push', 'web') and DEV_BRANCH.fullmatch(branch):
+        mode = 'fast'
+    else:
+        fail('Pipeline source/ref không được hỗ trợ hoặc chưa được bảo vệ')
+    if env('PIPELINE_KIND') not in ('', mode):
+        fail('PIPELINE_KIND không khớp source/ref')
+    return mode
+
+
 def plan():
-    mode = require('PIPELINE_KIND')
-    if mode not in ('fast', 'full', 'release'):
-        fail(f'PIPELINE_KIND không hợp lệ: {mode}')
+    mode = pipeline_mode()
     rows = catalog(strict_locks=mode != 'fast')
     index = {x['id']: x for x in rows}
     branch, tag, src = env('CI_COMMIT_BRANCH'), env('CI_COMMIT_TAG'), env('CI_PIPELINE_SOURCE')
@@ -461,7 +491,9 @@ def plan():
     override = env('IMAGE_SELECTION', 'auto')
     if override != 'auto':
         if src != 'web' or tag or release_branch:
-            fail('IMAGE_SELECTION chỉ được override qua Run pipeline trên main hoặc branch FAST')
+            fail('IMAGE_SELECTION chỉ được override qua Run pipeline trên branch FAST hoặc dùng all trên main')
+        if ref_kind == 'main' and override != 'all':
+            fail('Protected main phải chạy toàn bộ image enabled; dùng IMAGE_SELECTION=auto hoặc all')
         if override == 'all':
             selected = [r['id'] for r in rows if r['enabled']]
         else:

@@ -7,9 +7,12 @@ ci:tools:
   extends: .tools
   stage: validate
   needs: []
+  rules: &parent_jobs
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web"'
 
 validate:catalog:
   stage: validate
+  rules: *parent_jobs
   image: $PYTHON_IMAGE
   needs:
     - job: ci:tools
@@ -19,6 +22,7 @@ validate:catalog:
 
 validate:shell:
   stage: validate
+  rules: *parent_jobs
   image: $SHELL_IMAGE
   needs: []
   before_script:
@@ -28,6 +32,7 @@ validate:shell:
 
 security:source:
   stage: validate
+  rules: *parent_jobs
   image:
     name: $TRIVY_IMAGE
     entrypoint: [""]
@@ -43,6 +48,7 @@ security:source:
 
 prepare:plan:
   stage: plan
+  rules: *parent_jobs
   image: $PYTHON_IMAGE
   needs:
     - {job: 'ci:tools', artifacts: true}
@@ -51,6 +57,15 @@ prepare:plan:
     - {job: 'security:source', artifacts: false}
   script:
     - python3 .ci-tools/scripts/plan.py --output generated-child.yml
+    - |
+      mode="$(python3 -c 'import json; print(json.load(open("pipeline-plan.json"))["mode"])')"
+      if [ "$mode" != fast ]; then
+        : "${IMAGE_GATE_TOOLS_IMAGE:?Set IMAGE_GATE_TOOLS_IMAGE to the pinned build-gate tool image}"
+        : "${COSIGN_IMAGE:?Set COSIGN_IMAGE to a pinned shell-capable image}"
+        if [ "${DEVGUARD_ENABLED:-false}" = true ]; then
+          : "${DEVGUARD_SCANNER_IMAGE:?Set DEVGUARD_SCANNER_IMAGE when enabling DevGuard}"
+        fi
+      fi
     - cat pipeline-plan.json
   artifacts:
     expire_in: 7 days
@@ -58,6 +73,7 @@ prepare:plan:
 
 pipeline:images:
   stage: build
+  rules: *parent_jobs
   needs:
     - {job: 'prepare:plan', artifacts: true}
   # Trigger/bridge jobs have no image, services or script.
@@ -72,6 +88,7 @@ pipeline:images:
 
 cleanup:root:
   stage: cleanup
+  rules: *parent_jobs
   image: $SHELL_IMAGE
   when: always
   needs:

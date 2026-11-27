@@ -42,6 +42,7 @@ Một số từ dùng trong tài liệu:
 - `catalog.py` — đọc `images.json`, chọn image cần build.
 - `plan.py` — sinh child pipeline.
 - `pipeline.py` — validate, build, smoke test, patch, runtime check.
+- `build_gate.py` — build, scan, patch và runtime trong cùng runner; chỉ copy archive đã qua gate.
 - `job.py` — quản lý Docker auth trong job.
 - `harbor.py` — đọc digest, gắn tag Harbor.
 - `release.py` — evidence/provenance, GitLab Release.
@@ -71,13 +72,13 @@ flowchart TD
     A["Build candidate"] --> B["Quét lỗ hổng"]
     B --> C["Vá OS package"]
     C --> D["Kiểm tra lại + chạy thử"]
-    D --> E["SBOM + evidence"]
-    E --> F["Ký Cosign"]
+    D --> E["SBOM + copy digest đã duyệt vào Harbor"]
+    E --> F["Evidence + ký và xác minh Cosign"]
     F --> G["Gắn tag Harbor"]
     G --> H["GitLab Release nếu cần"]
 ```
 
-Mọi bước kiểm tra dùng **digest cố định**, không truyền dữ liệu qua tag tạm.
+Image gốc và bản vá chỉ tồn tại trên runner. Chỉ archive cuối được copy, kiểm tra digest rồi ký; tag `ci-p…` và tag phát hành trỏ vào cùng digest. Xem [runbook](docs/ROLLOUT_VI.md) cho cấu hình tool image, pilot và retention.
 
 ## 4. Cách dùng
 
@@ -109,8 +110,12 @@ GitLab **Settings → CI/CD → Variables**:
 | `HARBOR_USER` / `HARBOR_PASSWORD` | FULL/RELEASE | Robot push, đặt **Protected**. |
 | `COSIGN_PRIVATE_KEY` / `COSIGN_PASSWORD` | Sign/RELEASE | Khóa ký, không đưa vào chat/log. |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | Môi trường cần proxy | Chỉ qua biến. |
-| `IMAGE_SELECTION` | Run pipeline thủ công | Ví dụ `vscode`. |
+| `IMAGE_SELECTION` | Run pipeline thủ công | FAST có thể chọn ID; protected `main` chỉ nhận `auto` hoặc `all` (toàn bộ image enabled). |
 | `BUILDX_BUILDER_NETWORK` | Thử network khác | Mặc định để trống. |
+
+### Nâng cấp consumer đang chạy
+
+Dùng [mẫu consumer](docs/consumer.gitlab-ci.yml) và [runbook rollout](docs/ROLLOUT_VI.md) sau khi có tag engine đã publish trên GitLab đích. Mẫu giữ rule MR trong consumer; engine tự suy ra mode. Catalog có thể khai báo `"runtime": {"uid": 65532, "shell": "/bin/sh", "require_kasm": false}` cho image non-root không dùng Kasm. Các image cũ giữ profile mặc định.
 
 ### Bước 3: chạy theo luồng
 

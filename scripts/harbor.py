@@ -97,6 +97,15 @@ def expected(name):
     return row, ref(row, required('IMAGE_CANDIDATE_TAG'))
 
 
+def selected_candidate(candidate, report):
+    expected_ref = candidate
+    if report.get('status') == 'patched' and report.get('transport') != 'local-archive':
+        expected_ref += '-patched'
+    if report.get('candidate') != candidate or report.get('final_candidate') != expected_ref:
+        fail('Patch evidence không khớp candidate ref')
+    return expected_ref
+
+
 def snapshot(_args):
     name = required('IMAGE_ID')
     row, candidate = expected(name)
@@ -104,10 +113,11 @@ def snapshot(_args):
     if build.get('candidate') != candidate:
         fail('Build artifact không khớp candidate ref')
     report = document(file(name, 'patch.json'))
-    if report.get('candidate') != candidate:
-        fail('Patch evidence không khớp candidate ref')
+    final_candidate = selected_candidate(candidate, report)
+    if report.get('build_reference') != build.get('reference'):
+        fail('Patch build digest không khớp build evidence')
     harbor = Harbor()
-    digest = harbor.digest(row['repository'], required('IMAGE_CANDIDATE_TAG'))
+    digest = harbor.digest(row['repository'], final_candidate.rsplit(':', 1)[1])
     if digest is None:
         fail('Candidate tag không tồn tại trên Harbor')
     immutable = candidate.rsplit(':', 1)[0] + '@' + digest
@@ -163,23 +173,28 @@ def gate_policy(row):
     return security_gate(row)
 
 
-def check_gate_report(name, policy):
+def report_findings(name, policy):
     checked = document(file(name, 'verify.json'))
-    severities = {value for value in policy['severity'].split(',')}
-    gated = gate_findings(checked, severities, policy['pkg_types'], policy['ignore_unfixed'])
+    severities = set(policy['severity'].split(','))
+    return gate_findings(checked, severities, policy['pkg_types'], policy['ignore_unfixed'])
+
+
+def check_gate_report(name, policy):
+    gated = report_findings(name, policy)
     if gated:
         fail(f'{name} vẫn còn CVE {gated[0]}')
-    return gated
 
 
 def gate(_args):
     name = required('IMAGE_ID')
     row = one(name)
     policy = gate_policy(row)
-    check_gate_report(name, policy)
+    gated = report_findings(name, policy)
     result = {'image_id': name, 'policy': security_policy_evidence(row),
-              'result': 'pass', 'findings': []}
+              'result': 'fail' if gated else 'pass', 'findings': gated}
     write(file(name, 'verify-policy.json'), result)
+    if gated:
+        fail(f'{name} vẫn còn CVE {gated[0]}')
     print('Security gate OK:', name, policy['severity'], policy['pkg_types'])
 
 
@@ -235,7 +250,9 @@ def promote(_args):
     ensure_verified(name, immutable)
     harbor = Harbor()
     digest = immutable.rsplit('@', 1)[1]
-    if harbor.digest(row['repository'], required('IMAGE_CANDIDATE_TAG')) != digest:
+    patch = document(file(name, 'patch.json'))
+    final_candidate = selected_candidate(candidate, patch)
+    if patch.get('reference') != immutable or harbor.digest(row['repository'], final_candidate.rsplit(':', 1)[1]) != digest:
         fail('Candidate digest đã thay đổi sau khi scan: từ chối promote')
     previous = harbor.digest(row['repository'], final)
     if previous and previous != digest and kind == 'release':
@@ -246,7 +263,7 @@ def promote(_args):
         harbor.tag(row['repository'], digest, final)
     if harbor.digest(row['repository'], final) != digest:
         fail('Harbor tag verification failed')
-    output = {'image_id': name, 'candidate': candidate, 'reference': immutable,
+    output = {'image_id': name, 'candidate': candidate, 'final_candidate': final_candidate, 'reference': immutable,
               'promoted': ref(row, final), 'digest': digest}
     write(file(name, 'promotion.json'), output)
     print('Promotion OK:', output['promoted'], digest)

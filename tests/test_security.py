@@ -142,6 +142,9 @@ class SecurityTests(fixtures.PipelineTests):
                 {'VulnerabilityID': 'CVE-LIB-UNFIXED', 'Severity': 'CRITICAL'}]}]})
         with self.assertRaisesRegex(SystemExit, 'CVE-LIB-UNFIXED'):
             harbor.gate(None)
+        result = catalog.document('out/chrome/verify-policy.json')
+        self.assertEqual(result['result'], 'fail')
+        self.assertEqual(result['findings'], ['CVE-LIB-UNFIXED'])
 
     def test_gate_default_is_strict_all_classes_including_unfixed(self):
         report = {'Results': [
@@ -175,7 +178,8 @@ class SecurityTests(fixtures.PipelineTests):
         immutable = base.rsplit(':', 1)[0] + '@sha256:' + 'b' * 64
         Path('out/chrome').mkdir(parents=True, exist_ok=True)
         Path('out/chrome/verified.txt').write_text(immutable + '\n')
-        catalog.write('out/chrome/build.json', {'candidate': base})
+        initial = base.rsplit(':', 1)[0] + '@sha256:' + 'a' * 64
+        catalog.write('out/chrome/build.json', {'candidate': base, 'reference': initial})
         catalog.write('out/chrome/patch.json', {'candidate': base, 'status': 'patched', 'reference': immutable})
         catalog.write('out/chrome/runtime.json', {'reference': immutable, 'result': 'pass'})
         for part in ('scan.json', 'verify.json', 'sbom.cdx.json'):
@@ -186,7 +190,14 @@ class SecurityTests(fixtures.PipelineTests):
         release.evidence(None)
         evidence = catalog.document('out/chrome/evidence.json')
         self.assertEqual(evidence['gate_policy'], policy)
+        self.assertEqual(evidence['build_reference'], initial)
+        self.assertEqual(evidence['reference'], immutable)
+        provenance = catalog.document('out/chrome/provenance.json')['buildDefinition']
+        self.assertIn({'uri': initial, 'digest': {'sha256': 'a' * 64}}, provenance['resolvedDependencies'])
         self.assertIn('CRITICAL', Path('out/chrome/summary.md').read_text())
+        catalog.write('out/chrome/patch.json', {'candidate': base, 'status': 'patched', 'reference': initial})
+        with self.assertRaisesRegex(SystemExit, 'digest'):
+            release.evidence(None)
 
     def test_immutable_promotion_refuses_existing_other_digest(self):
         self.full()
@@ -196,6 +207,7 @@ class SecurityTests(fixtures.PipelineTests):
         immutable = candidate.rsplit(':',1)[0]+'@sha256:'+'b'*64
         Path('out/chrome').mkdir(parents=True)
         Path('out/chrome/verified.txt').write_text(immutable)
+        catalog.write('out/chrome/patch.json', {'candidate': candidate, 'final_candidate': candidate, 'reference': immutable})
         with patch.object(harbor, 'ensure_verified'), patch.object(harbor, 'Harbor') as client:
             client.return_value.digest.side_effect = ['sha256:'+'b'*64, 'sha256:'+'c'*64]
             with self.assertRaisesRegex(SystemExit, 'Immutable'):

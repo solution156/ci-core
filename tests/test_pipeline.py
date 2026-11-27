@@ -251,19 +251,33 @@ class PipelineTests(unittest.TestCase):
         os.environ['CI_PIPELINE_SOURCE'] = 'web'
         self.assertEqual([x['id'] for x in catalog.plan()['images']], ['chrome'])
 
+    def test_protected_web_main_rejects_subset(self):
+        self.full()
+        os.environ.update(CI_PIPELINE_SOURCE='web', IMAGE_SELECTION='chrome')
+        with self.assertRaisesRegex(SystemExit, 'main'):
+            catalog.plan()
+
+    def test_thin_consumer_needs_no_pipeline_kind(self):
+        self.full()
+        os.environ.pop('PIPELINE_KIND')
+        self.assertEqual(catalog.plan()['mode'], 'full')
+        os.environ['PIPELINE_KIND'] = 'fast'
+        with self.assertRaises(SystemExit):
+            catalog.plan()
+
     def test_generated_full_dag_no_missing_needs(self):
         self.full()
         plan.generate('generated.yml')
         generated = yaml.safe_load(Path('generated.yml').read_text())
         template = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
         jobs = {k: v for k, v in generated.items() if isinstance(v, dict) and 'extends' in v}
-        self.assertIn('gen-sbom:chrome', jobs)
+        self.assertIn('evidence:chrome', jobs)
         self.assertIn('cleanup:chrome', jobs)
         for name, job in jobs.items():
             self.assertIn(job['extends'], template, name)
             for need in job['needs']:
                 self.assertIn(need['job'], set(jobs) | {'ci:tools'}, name)
-        for name in ('scan:chrome', 'sign:chrome', 'promote:chrome'):
+        for name in ('build:chrome', 'sign:chrome', 'promote:chrome'):
             self.assertTrue(jobs[name]['needs'])
 
     def test_vscode_enabled_empty_lock_fails_clearly(self):

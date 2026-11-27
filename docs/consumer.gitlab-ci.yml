@@ -1,0 +1,23 @@
+# Copy to the consumer root only after publishing the engine revision to the target GitLab.
+# Replace these two placeholders; the aliases keep the include and script checkout aligned.
+include:
+  - project: &core_project group/ci-core
+    ref: &core_ref REPLACE_WITH_PUBLISHED_IMMUTABLE_REF
+    file: /templates/workspace-parent.yaml
+
+variables:
+  CI_CORE_PROJECT: *core_project
+  CI_CORE_REF: *core_ref
+
+# Keep MR activation in the root file. These rules only admit events;
+# the engine derives the mode and validates protection, image and version.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(feature|bugfix|hotfix)\// && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^(release\/)?[a-z0-9][a-z0-9._-]*\/v[0-9]+\.[0-9]+\.[0-9]+$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_COMMIT_REF_PROTECTED == "true" && ($CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web")'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/[a-z0-9][a-z0-9._-]*\/v[0-9]+\.[0-9]+\.[0-9]+$/ && $CI_COMMIT_REF_PROTECTED == "true" && ($CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web")'
+    - if: '$CI_COMMIT_BRANCH =~ /^(feature|bugfix|hotfix)\/[a-zA-Z0-9][a-zA-Z0-9._\/-]*$/ && ($CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "web")'
+    - when: never

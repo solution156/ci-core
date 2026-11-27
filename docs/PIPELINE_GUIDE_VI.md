@@ -22,17 +22,15 @@ Parent: validate → plan → native trigger → cleanup.
 DAG FULL/RELEASE cho mỗi image:
 
 ```text
-build -> scan -> patch -> verify:trivy + verify:runtime
-      -> gen-sbom -> evidence -> sign -> [devguard] -> promote -> [release] -> cleanup
+build (local build → scan → patch nếu cần → gate → runtime → SBOM → copy một archive)
+      -> evidence -> sign -> [devguard] -> promote -> [release] -> cleanup
 ```
 
-- Build ghi `build.json` và `built.txt` chứa digest sau push.
-- Scan ban đầu đọc **built digest**, dùng làm đầu vào chọn OS patches.
-- Patch dùng FROM digest ban đầu, không dùng mutable tag làm base; sau push ghi digest mới trong `patch.json`.
-- Harbor snapshot đọc lại registry và từ chối nếu candidate không còn khớp digest do patch ghi nhận.
-- Trivy gate, runtime, SBOM, evidence/sign đều dùng post-patch `verified.txt`.
+- `build.json` ghi digest archive ban đầu, `patch.json` ghi digest cuối; Trivy scan archive ngay trên runner. Việc vá dùng image local của job và scan lại kết quả.
+- Skopeo chỉ copy sau khi catalog gate và runtime pass, yêu cầu giữ nguyên digest. `verified.txt` được ghi sau khi đọc lại manifest registry và đối chiếu digest.
+- Cosign ký image và xuất bộ SBOM/provenance của release; BuildKit không đẩy thêm bộ attestation. VEX chỉ xuất khi catalog có nguồn được khai báo.
 - Artifact của mỗi image nằm ở `out/<image-id>/`; `needs:artifacts` cấp trực tiếp. Chỉ evidence/sign/promote giữ bundle tổng hợp có chủ đích.
-- Gate severity là lỗi thực qua `--exit-code 1`. Scan ban đầu chỉ lập báo cáo để có thể patch trước gate cuối.
+- Trivy xuất báo cáo đầy đủ; gate Python áp policy catalog và trả lỗi sau khi lưu báo cáo. Gate fail không gọi Skopeo copy.
 - Promote chỉ đổi tag trên artifact đã kiểm thử, không rebuild; release tag khác digest đã tồn tại bị từ chối.
 - Release API đọc lại tag/commit sau POST; retry với release khớp đã tồn tại là idempotent.
 - Những thao tác mutable main/RC dùng resource_group; vẫn cần chính sách Harbor immutability cho release tags trên server.
@@ -114,7 +112,7 @@ Opt-in integration **thật** nhưng dùng fixture nhỏ, không phải Chrome/V
 /usr/bin/python3 tests/local_integration.py --run       # thực thi local Docker
 ```
 
-Harness dựng registry tạm chỉ bind `127.0.0.1`, tạo fixture Git/image, gọi runtime build/push/patch/runtime/evidence, scan/gate/SBOM bằng Trivy thật, ký/verify bằng key tạm Cosign. Registry bị xóa đúng tên khi kết thúc; không prune daemon hay tác động Harbor production. Checkpoint Harbor snapshot được thay bằng read-back từ **OCI local**, ghi rõ đây không phải test Harbor API. Kết quả ở `ci-core/reports/local-integration/result.json`; log mỗi bước và evidence ở cùng cây. Private signing key test bị xóa sau run. Image/cache được giữ để retry nhanh, không tự xóa image khác.
+Harness chạy chính `build_gate.py`, dùng Trivy, Skopeo và Cosign thật với registry loopback. Nó kiểm tra một tag image trước khi ký và đọc lại digest; không gọi Harbor API. Registry, builder của fixture và khóa test được dọn riêng; không prune daemon hay tác động production. Kết quả mặc định ở `reports/local-integration/result.json` hoặc thư mục `--output`.
 
 Runtime CLI `pipeline.py`, `harbor.py`, `release.py` hỗ trợ `--dry-run` để in intent không gọi network/Docker. Đây không thay thế kiểm tra prerequisites/build thật.
 

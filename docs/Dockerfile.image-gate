@@ -1,0 +1,9 @@
+# Build and publish this utility image separately; set IMAGE_GATE_TOOLS_IMAGE
+# to the resulting immutable digest, and mirror the inputs for private runners.
+ARG TRIVY_IMAGE=aquasec/trivy:0.67.2
+ARG DOCKER_CLI_IMAGE=docker:27.5.1-cli
+FROM ${TRIVY_IMAGE} AS scanner
+FROM ${DOCKER_CLI_IMAGE}
+RUN apk add --no-cache bash ca-certificates git python3 skopeo=1.16.1-r5
+COPY --from=scanner /usr/local/bin/trivy /usr/local/bin/trivy
+RUN docker buildx version && trivy --version && skopeo --version

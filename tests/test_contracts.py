@@ -12,11 +12,44 @@ from test_pipeline import PipelineTests, CORE, WORKSPACE
 import catalog
 import pipeline
 import harbor
+import build_gate
 import release
 
 
 class Contracts(PipelineTests):
     # Reuse repository fixture but not inherited test methods.
+    def test_release_uses_local_gate_and_one_publish_job(self):
+        self.full()
+        import plan
+        plan.generate('generated.yml')
+        cfg = yaml.safe_load(Path('generated.yml').read_text())
+        self.assertEqual(cfg['build:chrome']['extends'], '.workspace-build-gate')
+        self.assertEqual(cfg['evidence:chrome']['needs'], [
+            {'job': 'ci:tools', 'artifacts': True}, {'job': 'build:chrome', 'artifacts': True}])
+        self.assertNotIn('patch:chrome', cfg)
+        self.assertNotIn('scan:chrome', cfg)
+
+    def test_failed_catalog_gate_never_copies_to_registry(self):
+        self.full()
+        os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-test',
+                          TRIVY_SCAN_SEVERITY='HIGH,CRITICAL')
+        def reports(archive, output, flags):
+            report = {'Results': []}
+            if output.name == 'verify.json':
+                report['Results'] = [{'Class': 'lang-pkgs', 'Vulnerabilities': [
+                    {'Severity': 'CRITICAL', 'VulnerabilityID': 'CVE-fixture'}]}]
+            catalog.write(output, report)
+        with patch.object(pipeline, 'build', return_value={'args': {}}), \
+             patch.object(build_gate, 'save_archive', return_value=('docker-archive:fixture', 'sha256:' + 'a' * 64, 'runtime-id')), \
+             patch.object(build_gate, 'trivy', side_effect=reports), \
+             patch.object(build_gate, 'copy_verified') as copy, \
+             patch.object(build_gate.subprocess, 'run'):
+            with self.assertRaisesRegex(SystemExit, 'CVE-fixture'):
+                build_gate.main()
+            copy.assert_not_called()
+        self.assertEqual(catalog.document('out/chrome/verify-policy.json')['result'], 'fail')
+        self.assertFalse(Path('out/chrome/verified.txt').exists())
+
     def test_effective_dag_stages_and_artifact_contracts(self):
         self.full()
         import plan
@@ -32,12 +65,7 @@ class Contracts(PipelineTests):
         stages = templates['stages']
         expected_inputs = {
             'build': {'ci:tools'},
-            'scan': {'build'}, 'patch': {'ci:tools', 'build', 'scan'},
-            'verify:trivy': {'ci:tools', 'patch'},
-            'verify:policy': {'ci:tools', 'patch', 'verify:trivy'},
-            'verify:runtime': {'ci:tools', 'patch'},
-            'gen-sbom': {'patch', 'verify:policy', 'verify:runtime'},
-            'evidence': {'ci:tools', 'build', 'scan', 'patch', 'verify:trivy', 'verify:policy', 'verify:runtime', 'gen-sbom'},
+            'evidence': {'ci:tools', 'build'},
             'sign': {'evidence'}, 'promote': {'ci:tools', 'sign'}, 'cleanup': {'promote'},
         }
         for name, raw in generated.items():
@@ -55,9 +83,9 @@ class Contracts(PipelineTests):
                 self.assertLessEqual(stages.index(source['stage']), stages.index(job['stage']), name)
                 if need['job'] != 'ci:tools':
                     self.assertTrue(need['job'].endswith(':' + image_id), name)
-            if prefix in ('scan', 'verify:trivy', 'gen-sbom', 'sign', 'promote'):
+            if prefix in ('sign', 'promote'):
                 self.assertNotIn('services', job, name)
-            if prefix in ('build', 'patch', 'verify:runtime'):
+            if prefix == 'build':
                 self.assertIn('services', job, name)
                 self.assertEqual(job['resource_group'], '$HEAVY_RESOURCE_GROUP')
 
@@ -70,15 +98,9 @@ class Contracts(PipelineTests):
         self.assertEqual(data['build:chrome']['extends'], '.workspace-smoke')
         self.assertFalse(any(k.startswith(('sign:', 'promote:', 'scan:', 'patch:')) for k in data))
 
-    def test_scan_and_sbom_use_digest_files(self):
+
+    def test_job_scripts_are_shell_strings(self):
         cfg = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
-        verify = cfg['.workspace-verify-trivy']['script'][0]
-        gate = cfg['.workspace-verify-policy']['script'][0]
-        self.assertIn('built.txt', cfg['.workspace-scan']['script'][0])
-        self.assertIn('verified.txt', cfg['.workspace-sbom']['script'][0])
-        self.assertIn('--exit-code 0', verify)
-        self.assertIn('harbor.py gate', gate)
-        self.assertIn('trivy image --format cyclonedx', cfg['.workspace-sbom']['script'][0])
         for job in cfg.values():
             if isinstance(job, dict):
                 for command in job.get('script', []):
@@ -109,6 +131,31 @@ class Contracts(PipelineTests):
             selected, _ = catalog.changed_images(catalog.catalog(strict_locks=False))
         self.assertEqual(selected, ['custom'])
 
+    def test_build_passes_worktree_relative_dockerfile_to_buildx(self):
+        import pipeline
+        self.full()
+        os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-fixture', IMAGE_FINAL_TAG='0.1.0-dev')
+        row = dict(pipeline.one('chrome'), build={'context': 'images/chrome', 'dockerfile': 'Dockerfile'})
+        with patch.object(pipeline, 'one', return_value=row), patch.object(pipeline, 'initialize_builder', return_value='test-builder'), patch.object(pipeline, 'run') as run, patch.object(pipeline, 'metadata_digest', side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                pipeline.build(type('Args', (), {'command': 'build'})())
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index('-f') + 1], 'images/chrome/Dockerfile')
+        self.assertEqual(command[-1], 'images/chrome')
+
+    def test_generic_image_runtime_does_not_require_kasm(self):
+        data = json.loads(Path('images.json').read_text())
+        row = next(r for r in data['images'] if r['id'] == 'chrome')
+        row['runtime'] = {'uid': 65532, 'shell': '/bin/sh', 'require_kasm': False}
+        Path('images/chrome/Dockerfile').write_text('FROM alpine:3.21\nUSER 65532\n')
+        Path('images.json').write_text(json.dumps(data))
+        with patch.object(pipeline, 'run') as run, patch.object(pipeline.subprocess, 'run'):
+            pipeline.runtime_check(catalog.one('chrome'), 'fixture')
+        command = run.call_args.args[0]
+        self.assertIn('/bin/sh', command)
+        self.assertIn('65532', command[-1])
+        self.assertNotIn('/dockerstartup', command[-1])
+
     def test_catalog_rejects_secret_like_build_arg_names(self):
         import catalog
         data = json.loads(Path('images.json').read_text())
@@ -120,7 +167,8 @@ class Contracts(PipelineTests):
 
     def test_gate_policy_artifact_is_generated_from_catalog(self):
         import pipeline
-        os.environ.update(PIPELINE_KIND='full', GATE_PKG_TYPES='os', GATE_IGNORE_UNFIXED='true')
+        self.full()
+        os.environ.update(GATE_PKG_TYPES='os', GATE_IGNORE_UNFIXED='true')
         pipeline.write_gate_policies(None)
         source = Path('out/gate-policy/chrome.sh').read_text()
         self.assertIn('POLICY_PKG_TYPES=os,library', source)
@@ -181,24 +229,26 @@ class Contracts(PipelineTests):
     def test_plan_does_not_emit_security_policy_variables(self):
         import plan
         self.full()
-        os.environ.update(CI_PIPELINE_SOURCE='web', IMAGE_SELECTION='chrome')
+        os.environ.update(CI_PIPELINE_SOURCE='web', IMAGE_SELECTION='all')
         plan.generate('generated.yml')
         data = yaml.safe_load(Path('generated.yml').read_text())
-        for name in ('verify:trivy:chrome', 'verify:policy:chrome', 'promote:chrome'):
+        for name in ('build:chrome', 'evidence:chrome', 'promote:chrome'):
             self.assertFalse(any(key.startswith('GATE_') for key in data[name].get('variables', {})))
-        self.assertIn('ci:tools', {need['job'] for need in data['verify:trivy:chrome']['needs']})
-        self.assertIn('verify:trivy:chrome', {need['job'] for need in data['verify:policy:chrome']['needs']})
+        self.assertIn('ci:tools', {need['job'] for need in data['build:chrome']['needs']})
+        self.assertIn('build:chrome', {need['job'] for need in data['evidence:chrome']['needs']})
 
-    def test_verify_gate_uses_catalog_policy_artifact(self):
+    def test_gate_job_keeps_reports_and_does_not_archive_images(self):
         cfg = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
-        scan = cfg['.workspace-verify-trivy']['script'][0]
-        gate = cfg['.workspace-verify-policy']['script'][0]
-        self.assertIn('out/gate-policy/$IMAGE_ID.sh', scan)
-        self.assertIn('POLICY_VEX_FILES', scan)
-        self.assertIn('harbor.py gate', gate)
-        self.assertNotIn('GATE_PKG_TYPES', scan)
-        self.assertNotIn('GATE_IGNORE_UNFIXED', scan)
-        self.assertNotIn('TRIVY_GATE_SEVERITY', scan)
+        job = cfg['.workspace-build-gate']
+        self.assertIn('python3 .ci-tools/scripts/build_gate.py', job['script'])
+        self.assertEqual(job['artifacts']['when'], 'always')
+        self.assertEqual(job['artifacts']['paths'], ['out/$IMAGE_ID/*.json', 'out/$IMAGE_ID/verified.txt'])
+
+    def test_sign_marker_is_written_after_registry_signature_verification(self):
+        config = yaml.safe_load((CORE / 'templates/workspace-child.yaml').read_text())
+        script = config['.workspace-sign']['script'][0]
+        self.assertLess(script.index('cosign sign '), script.index('cosign verify '))
+        self.assertLess(script.index('cosign verify '), script.index('/signed.txt'))
 
     def test_run_redacts_proxy_values_but_shows_network_driver_opt(self):
         import catalog
@@ -299,12 +349,31 @@ class Contracts(PipelineTests):
         os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-test')
         candidate = catalog.ref(catalog.one('chrome'), 'ci-test')
         catalog.write('out/chrome/build.json', {'candidate': candidate})
-        catalog.write('out/chrome/patch.json', {'candidate': candidate, 'reference': candidate.rsplit(':',1)[0]+'@sha256:'+'b'*64})
+        catalog.write('out/chrome/patch.json', {'candidate': candidate, 'final_candidate': candidate, 'reference': candidate.rsplit(':',1)[0]+'@sha256:'+'b'*64})
         with patch.object(harbor, 'Harbor') as client:
             client.return_value.digest.return_value = 'sha256:'+'c'*64
             with self.assertRaisesRegex(SystemExit, 'digest'):
                 harbor.snapshot(None)
         self.assertFalse(Path('out/chrome/verified.txt').exists())
+
+    def test_patch_builds_and_snapshots_separate_candidate(self):
+        self.full()
+        os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-test')
+        candidate = catalog.ref(catalog.one('chrome'), 'ci-test')
+        original = candidate.rsplit(':', 1)[0] + '@sha256:' + 'a' * 64
+        final = candidate.rsplit(':', 1)[0] + '@sha256:' + 'b' * 64
+        catalog.write('out/chrome/build.json', {'candidate': candidate, 'commit': os.environ['CI_COMMIT_SHA'], 'reference': original})
+        catalog.write('out/chrome/scan.json', {'Results': [{'Class': 'os-pkgs', 'Type': 'debian', 'Vulnerabilities': [{'PkgName': 'bash', 'Severity': 'CRITICAL', 'FixedVersion': '1'}]}]})
+        with patch.object(pipeline, 'initialize_builder', return_value='fixture'), patch.object(pipeline, 'run', return_value='1000') as run, patch.object(pipeline, 'metadata_digest', return_value=final):
+            pipeline.patch(None)
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:3], ['docker', 'buildx', 'build'])
+        self.assertEqual(cmd[cmd.index('-t') + 1], candidate + '-patched')
+        with patch.object(harbor, 'Harbor') as client:
+            client.return_value.digest.return_value = 'sha256:' + 'b' * 64
+            harbor.snapshot(None)
+            client.return_value.digest.assert_called_once_with('chrome', 'ci-test-patched')
+        self.assertEqual(Path('out/chrome/verified.txt').read_text().strip(), final)
 
     def test_valid_lock_can_enable_vscode(self):
         data = json.loads(Path('images.json').read_text())

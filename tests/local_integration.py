@@ -13,7 +13,8 @@ import secrets
 import subprocess
 import sys
 import tempfile
-import time
+import shlex
+import urllib.request
 
 CORE = Path(__file__).resolve().parents[1]
 
@@ -76,42 +77,60 @@ USER 1000
                    IMAGE_FINAL_TAG='0.1.0-dev',
                    ROOT_PIPELINE_ID=runid, CI_PIPELINE_ID=runid, CI_COMMIT_SHA=sha,
                    CI_PROJECT_URL=work.as_uri(), CI_PROJECT_PATH='local/fixture',
-                   CI_PIPELINE_URL=work.as_uri(), CI_COMMIT_BRANCH='main', CI_COMMIT_TAG='',
+                   CI_PIPELINE_URL=work.as_uri(), CI_COMMIT_BRANCH='main', CI_COMMIT_TAG='', CI_PIPELINE_SOURCE='push',
                    CI_COMMIT_REF_PROTECTED='true', WORKSPACE_REF_KIND='main',
                    HARBOR_REGISTRY=host, HARBOR_PROJECT='integration',
-                   TRIVY_SCAN_SEVERITY='HIGH,CRITICAL', TRIVY_GATE_SEVERITY='CRITICAL',
+                   TRIVY_SCAN_SEVERITY='HIGH,CRITICAL',
                    AUTO_PATCH_OS='false', TRIVY_PATCH_SEVERITY='HIGH,CRITICAL')
-        # Source SHA comes from a real local fixture commit; it is NOT a GitLab pipeline.
-        run('fixture-build-push', [sys.executable, str(CORE / 'scripts/pipeline.py'), 'build'], cwd=work)
-        artifacts = work / 'out/fixture'
-        immutable = (artifacts / 'built.txt').read_text().strip()
-        report['image_reference'] = immutable
-        run('registry-digest-readback', ['docker', 'pull', immutable])
-        run('archive', ['docker', 'save', '-o', str(artifacts / 'image.tar'), immutable])
+        # Run the same build-gate entrypoint; wrappers only supply tools and a
+        # loopback HTTP exception, never a production auth/TLS override.
+        bindir = work / 'bin'
+        bindir.mkdir()
+        tmp = work / 'tmp'
+        tmp.mkdir()
+        auth = work / '.docker-job'
+        auth.mkdir()
+        (auth / 'config.json').write_text('{"auths": {}}')
         cache = output / 'trivy-cache'
         cache.mkdir(exist_ok=True)
-        trivy = ['docker', 'run', '--rm', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-                 '-v', str(artifacts) + ':/work', '-v', str(cache) + ':/root/.cache/trivy', a.trivy_image]
-        run('trivy-scan', [*trivy, 'image', '--input', '/work/image.tar', '--scanners', 'vuln', '--severity', 'HIGH,CRITICAL', '--format', 'json', '--output', '/work/scan.json'])
-        run('patch-no-mutation', [sys.executable, str(CORE / 'scripts/pipeline.py'), 'patch'], cwd=work)
-        # No Harbor API here: the LOCAL checkpoint is read back from the real OCI registry.
-        post = json.loads((artifacts / 'patch.json').read_text())['reference']
-        if post != immutable:
-            raise RuntimeError('Local fixture unexpectedly mutated during no-patch test')
-        (artifacts / 'verified.txt').write_text(immutable + '\n')
-        run('trivy-critical-gate', [*trivy, 'image', '--input', '/work/image.tar', '--scanners', 'vuln', '--severity', 'CRITICAL', '--exit-code', '1', '--format', 'json', '--output', '/work/verify.json'])
-        run('runtime', [sys.executable, str(CORE / 'scripts/pipeline.py'), 'runtime'], cwd=work)
-        run('sbom', [*trivy, 'image', '--input', '/work/image.tar', '--format', 'cyclonedx', '--output', '/work/sbom.cdx.json'])
+        conf = work / 'registries.conf'
+        conf.write_text('[[registry]]\nlocation = ' + json.dumps(host) + '\ninsecure = true\n')
+        wrappers = {
+            'trivy': ['-v', str(cache) + ':/root/.cache/trivy', a.trivy_image],
+            'skopeo': ['--network', 'host', '-v', str(conf) + ':/etc/containers/registries.conf:ro',
+                       'quay.io/skopeo/stable:v1.18.0'],
+        }
+        for cmd, extra in wrappers.items():
+            wrapper = bindir / cmd
+            wrapper.write_text('#!/bin/sh\nexec ' + shlex.join([
+                'docker', 'run', '--rm', '-v', f'{work}:{work}', '-w', str(work), *extra,
+            ]) + ' "$@"\n')
+            wrapper.chmod(0o700)
+        env.update(PATH=str(bindir) + ':' + env['PATH'], TMPDIR=str(tmp))
+        run('build-gate-and-copy', [sys.executable, str(CORE / 'scripts/build_gate.py')], cwd=work)
+        artifacts = work / 'out/fixture'
+        immutable = (artifacts / 'verified.txt').read_text().strip()
+        report['image_reference'] = immutable
+        with urllib.request.urlopen(f'http://{host}/v2/integration/fixture/tags/list', timeout=10) as response:
+            tags = json.load(response)['tags']
+        if tags != [env['IMAGE_CANDIDATE_TAG']]:
+            raise RuntimeError('Unexpected image tags before signing: ' + repr(tags))
+        report['pre_sign_image_tags'] = tags
+        run('registry-digest-readback', ['docker', 'pull', immutable])
         run('evidence', [sys.executable, str(CORE / 'scripts/release.py'), 'evidence'], cwd=work)
         keys = work / 'disposable-keys'
         keys.mkdir(mode=0o700)
         password = secrets.token_urlsafe(24)
         cosign = ['docker', 'run', '--rm', '--user', '0:0', '--network', 'host',
-                  '-v', str(keys) + ':/keys', '-e', 'COSIGN_PASSWORD', a.cosign_image]
+                  '-v', str(keys) + ':/keys', '-v', str(artifacts) + ':/evidence:ro', '-e', 'COSIGN_PASSWORD', a.cosign_image]
         keyenv = {'COSIGN_PASSWORD': password}
         run('cosign-keygen', [*cosign, 'generate-key-pair', '--output-key-prefix=/keys/cosign'], extra=keyenv)
         run('cosign-sign', [*cosign, 'sign', '--yes', '--key', '/keys/cosign.key', '--tlog-upload=false', '--allow-insecure-registry', immutable], extra=keyenv)
-        run('cosign-verify', [*cosign, 'verify', '--key', '/keys/cosign.pub', '--insecure-ignore-tlog', '--allow-insecure-registry', immutable], extra=keyenv)
+        run('cosign-public-key', [*cosign, 'public-key', '--key', '/keys/cosign.key', '--outfile', '/keys/verify.pub'], extra=keyenv)
+        run('cosign-verify', [*cosign, 'verify', '--key', '/keys/verify.pub', '--insecure-ignore-tlog', '--allow-insecure-registry', immutable], extra=keyenv)
+        for kind, filename in [('cyclonedx', 'sbom.cdx.json'), ('slsaprovenance1', 'provenance.json')]:
+            run('attest-' + kind, [*cosign, 'attest', '--yes', '--key', '/keys/cosign.key', '--tlog-upload=false', '--allow-insecure-registry', '--type', kind, '--predicate', '/evidence/' + filename, immutable], extra=keyenv)
+            run('verify-' + kind, [*cosign, 'verify-attestation', '--key', '/keys/verify.pub', '--insecure-ignore-tlog', '--allow-insecure-registry', '--type', kind, immutable], extra=keyenv)
         (keys / 'cosign.key').unlink(missing_ok=True)
         report['status'] = 'pass'
     except Exception as exc:
@@ -119,6 +138,12 @@ USER 1000
         report['error'] = str(exc)
         print(str(exc), file=sys.stderr)
     finally:
+        if (work / '.docker-job' / 'buildx-builder').is_file():
+            try:
+                run('builder-cleanup', [sys.executable, str(CORE / 'scripts/job.py'), 'cleanup-auth'], cwd=work)
+            except Exception:
+                report['status'] = 'fail'
+                report.setdefault('error', 'Fixture builder cleanup failed')
         # Only the container explicitly created in this run, with its anonymous volumes.
         if started:
             stopped = subprocess.run(['docker', 'rm', '-f', '-v', name], env=env, capture_output=True, text=True)

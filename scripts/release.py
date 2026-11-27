@@ -5,10 +5,11 @@ import argparse
 import datetime
 import json
 import pathlib
+import re
 import urllib.error
 import urllib.request
 import urllib.parse
-from catalog import one, env, require, ref, document, write, fail, security_policy_evidence
+from catalog import one, env, require, ref, document, write, fail, security_policy_evidence, runtime_config
 
 
 def file(name, part):
@@ -20,10 +21,16 @@ def evidence(_args):
     row = one(name)
     candidate = ref(row, require('IMAGE_CANDIDATE_TAG'))
     immutable = file(name, 'verified.txt').read_text(encoding='utf-8').strip()
-    if not immutable.startswith(candidate.rsplit(':', 1)[0] + '@sha256:'):
+    digest_pattern = re.escape(candidate.rsplit(':', 1)[0]) + r'@sha256:[a-f0-9]{64}'
+    if not re.fullmatch(digest_pattern, immutable):
         fail('Evidence digest khác candidate reference')
     build = document(file(name, 'build.json'))
     patch = document(file(name, 'patch.json'))
+    initial = build.get('reference')
+    if (not isinstance(initial, str) or not re.fullmatch(digest_pattern, initial)
+            or patch.get('reference') != immutable
+            or (patch.get('status') != 'patched' and initial != immutable)):
+        fail('Build/patch không khớp chuỗi digest đã xác minh')
     runtime = document(file(name, 'runtime.json'))
     if (build.get('candidate') != candidate or patch.get('candidate') != candidate or
             runtime.get('reference') != immutable or runtime.get('result') != 'pass'):
@@ -42,6 +49,7 @@ def evidence(_args):
     root_id = require('ROOT_PIPELINE_ID')
     manifest = {
         'image_id': name, 'image_version': row['version'], 'reference': immutable,
+        'build_reference': initial, 'patch_status': patch['status'],
         'git_sha': commit, 'git_tag': env('CI_COMMIT_TAG'), 'git_branch': env('CI_COMMIT_BRANCH'),
         'root_pipeline_id': root_id, 'child_pipeline_id': require('CI_PIPELINE_ID'),
         'pipeline_kind': require('WORKSPACE_REF_KIND'), 'generated_at': now,
@@ -61,7 +69,7 @@ def evidence(_args):
                 'platform': build.get('platform'), 'target': build.get('target'),
                 'buildArgs': build.get('build_args', {}), 'candidate': candidate,
             },
-            'internalParameters': {'rootPipelineId': root_id},
+            'internalParameters': {'rootPipelineId': root_id, 'patchStatus': patch['status']},
             'resolvedDependencies': [{'uri': 'git+' + core_source,
                                       'digest': {'gitCommit': commit}}],
         },
@@ -70,6 +78,10 @@ def evidence(_args):
             'metadata': {'invocationId': env('CI_PIPELINE_URL'), 'finishedOn': now},
         },
     }
+    if patch['status'] == 'patched':
+        provenance['buildDefinition']['resolvedDependencies'].append({
+            'uri': initial, 'digest': {'sha256': initial.rsplit(':', 1)[1]},
+        })
     write(file(name, 'provenance.json'), provenance)
     # Only VEX documents explicitly named by the catalog policy are emitted.
     statements = []
@@ -83,6 +95,7 @@ def evidence(_args):
             'author': env('CI_PROJECT_PATH'), 'timestamp': now,
             'version': 1, 'statements': statements,
         })
+    uid, _, kasm = runtime_config(row)
     summary = [f'# Phát hành {name} v{row["version"]}', '',
                f'- Image digest: `{immutable}`', f'- Commit: `{commit}`',
                f'- Parent pipeline: `{root_id}`', f'- Git ref: `{env("CI_COMMIT_TAG") or env("CI_COMMIT_BRANCH")}`',
@@ -90,7 +103,7 @@ def evidence(_args):
                f'ignore_unfixed=`{str(gate_policy["ignore_unfixed"]).lower()}`',
                f'- VEX source digests: `{gate_policy["vex_source_digests"]}`',
                f'- OS patch: `{patch["status"]}`',
-               '- Đã kiểm thử container dưới USER 1000 và các thư mục Kasm cơ bản.',
+               f'- Đã kiểm thử container dưới USER {uid}' + (' và các thư mục Kasm cơ bản.' if kasm else '.'),
                '- Kết quả kiểm thử này **không thay thế** UAT trình duyệt/GUI thực tế.', '']
     file(name, 'summary.md').write_text('\n'.join(summary), encoding='utf-8')
     print('Evidence sẵn sàng cho Cosign:', immutable)

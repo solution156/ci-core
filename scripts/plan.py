@@ -17,7 +17,7 @@ def generate(output):
             fail(key + ' không hợp lệ')
     if not selection['images']:
         config = {'stages': ['report'], 'images:no-changes': {
-            'stage': 'report', 'image': env('PYTHON_IMAGE', 'rd-harbor-secops.servicemicro.net/build/ci-tools:v1'),
+            'stage': 'report', 'image': env('PYTHON_IMAGE', 'python:3.12-alpine'),
             'script': ['echo "No affected images; validation completed."']}}
     else:
         config = {
@@ -45,16 +45,8 @@ def generate(output):
                 smoke = job('build', '.workspace-smoke', row, ['ci:tools'])
                 job('cleanup', '.workspace-cleanup', row, [smoke], when='always')
                 continue
-            build = job('build', '.workspace-build', row, ['ci:tools'])
-            scan = job('scan', '.workspace-scan', row, [build])
-            patch = job('patch', '.workspace-patch', row, ['ci:tools', build, scan])
-            verify_trivy = job('verify:trivy', '.workspace-verify-trivy', row, ['ci:tools', patch])
-            verify_policy = job('verify:policy', '.workspace-verify-policy', row,
-                                ['ci:tools', patch, verify_trivy])
-            runtime = job('verify:runtime', '.workspace-verify-runtime', row, ['ci:tools', patch])
-            sbom = job('gen-sbom', '.workspace-sbom', row, [patch, verify_policy, runtime])
-            evidence = job('evidence', '.workspace-evidence', row,
-                           ['ci:tools', build, scan, patch, verify_trivy, verify_policy, runtime, sbom])
+            build = job('build', '.workspace-build-gate', row, ['ci:tools'])
+            evidence = job('evidence', '.workspace-evidence', row, ['ci:tools', build])
             sign = job('sign', '.workspace-sign', row, [evidence])
             promote_needs = ['ci:tools', sign]
             if env('DEVGUARD_ENABLED', 'false').lower() == 'true':

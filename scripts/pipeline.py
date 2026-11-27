@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 from catalog import (catalog, one, ref, run, env, require, document, write, fail,
                      checked_path, docker_config_path, job_builder_name, lock_config, build_config,
-                     security_gate)
+                     security_gate, pipeline_mode, runtime_config)
 
 PROXIES = ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy')
 
@@ -58,7 +58,7 @@ def initialize_builder():
 
 def write_gate_policies(_args):
     """Emit per-image shell inputs from validated catalog policy, never CI variables."""
-    rows = catalog(strict_locks=env('PIPELINE_KIND') != 'fast')
+    rows = catalog(strict_locks=pipeline_mode() != 'fast')
     destination = pathlib.Path('out/gate-policy')
     destination.mkdir(parents=True, exist_ok=True)
     for row in rows:
@@ -77,13 +77,13 @@ def write_gate_policies(_args):
 
 
 def validate(_):
-    rows = catalog(strict_locks=env('PIPELINE_KIND') != 'fast')
+    rows = catalog(strict_locks=pipeline_mode() != 'fast')
     print('Validated', len(rows), 'image entries:')
     for row in rows:
         print(f'  {row["id"]:18} {row["version"]:12} enabled={row["enabled"]} shared={row["depends_on"]}')
 
 
-def build(args):
+def build(args, *, local_tag=None):
     fast = args.command == 'smoke'
     row = one(require('IMAGE_ID'), strict_locks=not fast)
     build = build_config(row)
@@ -92,17 +92,20 @@ def build(args):
         fail('Build push requires protected ref')
     tag = ('smoke-p' + require('ROOT_PIPELINE_ID')
            if fast else require('IMAGE_CANDIDATE_TAG'))
-    reference = ref(row, tag)
+    reference = local_tag or ref(row, tag)
     builder = initialize_builder()
     command = ['docker', 'buildx', 'build', '--builder', builder,
                '--pull', '--progress=plain', '--platform', build['platform'],
-               '-f', build['dockerfile'], '-t', reference,
+               '-f', str(pathlib.PurePosixPath(build['context']) / build['dockerfile']), '-t', reference,
                '--label', 'org.opencontainers.image.title=' + row['repository'],
                '--label', 'org.opencontainers.image.source=' + env('CI_PROJECT_URL'),
                '--label', 'org.opencontainers.image.revision=' + env('CI_COMMIT_SHA'),
                '--label', 'org.opencontainers.image.version=' + row['version']]
     metadata_file = path(row['id'], 'build-metadata.json')
-    if fast:
+    if local_tag:
+        command += ['--load', '--provenance=false', '--sbom=false', '--metadata-file', str(metadata_file)]
+        command += ['--cache-from', 'type=registry,ref=' + ref(row, require('IMAGE_FINAL_TAG'))]
+    elif fast:
         command += ['--load']
     else:
         # Preserve the registry cache policy while using the job-scoped builder;
@@ -125,6 +128,8 @@ def build(args):
         command += ['--build-arg', 'EXTENSION_MODE=resolve']
     command += [build['context']]
     run(command)
+    if local_tag:
+        return build
     if fast:
         if resolve_lock:
             extract_extension_lock(row, reference)
@@ -166,25 +171,21 @@ def metadata_digest(reference, metadata_file):
     return reference.rsplit(':', 1)[0] + '@' + digest
 
 
-def pushed_digest(reference):
-    immutable = run(['docker', 'image', 'inspect', '--format', '{{index .RepoDigests 0}}', reference], capture=True)
-    if not re.fullmatch(re.escape(reference.rsplit(':', 1)[0]) + r'@sha256:[a-f0-9]{64}', immutable):
-        fail('Docker push không trả digest hợp lệ')
-    return immutable
-
-
 def runtime_check(row, reference, generated_lock=None):
-    script = 'set -e; test "$(id -u)" = 1000; test -d /dockerstartup; test -d "$HOME"'
+    uid, shell, kasm = runtime_config(row)
+    script = f'set -e; test "$(id -u)" = {uid}'
+    if kasm:
+        script += '; test -d /dockerstartup; test -d "$HOME"'
     # docker run has no --build-arg; point the verifier at the lockfile generated
     # by the resolve-mode build via EXTENSIONS_LOCK (read by verify-extensions.sh).
     arguments = []
     if generated_lock:
         arguments += ['--env', 'EXTENSIONS_LOCK=' + generated_lock]
-    run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', '/bin/bash'] + arguments + [reference, '-lc', script])
+    run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', shell] + arguments + [reference, '-c', script])
     if row.get('runtime_check'):
         # Read a reviewed repository script and stream via stdin; no host mounts.
         with checked_path(row['runtime_check']).open('rb') as source:
-            subprocess.run(['docker', 'run', '--rm', '-i', '--network', 'none', '--entrypoint', '/bin/bash'] + arguments + [reference, '-s'], stdin=source, check=True)
+            subprocess.run(['docker', 'run', '--rm', '-i', '--network', 'none', '--entrypoint', shell] + arguments + [reference, '-s'], stdin=source, check=True)
 
 
 def patch_candidates(report):
@@ -224,28 +225,33 @@ def patch(args):
         fail('Patch push requires protected ref')
     status = 'no-applicable-os-fixes'
     final_reference = immutable
+    final_candidate = candidate
     if packages and env('AUTO_PATCH_OS', 'true').lower() == 'true':
         run(['docker', 'pull', immutable])
         user = run(['docker', 'image', 'inspect', '--format', '{{.Config.User}}', immutable], capture=True)
         if not re.fullmatch(r'[A-Za-z_0-9:.-]*', user):
             fail(f'{name}: user từ Docker inspect không an toàn')
-        instructions = ['FROM ' + immutable, 'USER root', 'ENV DEBIAN_FRONTEND=noninteractive',
-                        'RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade '
+        instructions = ['FROM ' + immutable, 'USER root',
+                        'RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade '
                         + ' '.join(packages) + ' && rm -rf /var/lib/apt/lists/*']
         if user:
             instructions.append('USER ' + user)
+        final_candidate = candidate + '-patched'
+        builder = initialize_builder()
+        metadata = path(name, 'patch-metadata.json')
         with tempfile.TemporaryDirectory(prefix='sdwf-patch-') as tmp:
             pathlib.Path(tmp, 'Dockerfile').write_text('\n'.join(instructions) + '\n', encoding='utf-8')
-            run(['docker', 'build', '--platform', build['platform'], '--progress=plain', '--pull=false',
-                 '-f', f'{tmp}/Dockerfile', '-t', candidate, *build_arguments(), tmp])
-        run(['docker', 'push', candidate])
-        final_reference = pushed_digest(candidate)
+            run(['docker', 'buildx', 'build', '--builder', builder, '--platform', build['platform'], '--progress=plain',
+                 '--push', '--provenance=mode=min', '--sbom=true', '--metadata-file', str(metadata),
+                 '-f', f'{tmp}/Dockerfile', '-t', final_candidate, *build_arguments(), tmp])
+        final_reference = metadata_digest(final_candidate, metadata)
         status = 'patched'
     elif packages:
         status = 'patch-disabled'
     write(path(name, 'patch.json'), {
-        'id': name, 'candidate': candidate, 'status': status, 'reference': final_reference,
-        'upgraded_packages': packages if status == 'patched' else [],
+        'id': name, 'candidate': candidate, 'final_candidate': final_candidate,
+        'build_reference': immutable, 'status': status, 'reference': final_reference,
+        'requested_packages': packages if status == 'patched' else [],
         'available_packages': packages, 'excluded_packages': skipped,
     })
 
