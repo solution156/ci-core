@@ -39,9 +39,15 @@ security:source:
   needs: []
   script:
     - mkdir -p reports
-    # JSON report for triage; gate decoded with grep, available in the Trivy
-    # image (it has no python3/jq). Any HIGH/CRITICAL finding still fails.
-    - trivy fs --scanners secret,misconfig --severity HIGH,CRITICAL --exit-code 0 --format json --output reports/source.json --skip-dirs .ci-tools .
+    # DS002 (Dockerfile USER root) is excluded: custom images may legitimately
+    # run as root and runtime identity is verified after build. Every other
+    # HIGH/CRITICAL misconfiguration or secret still fails this job.
+    - |
+      cat > /tmp/source-trivyignore <<'EOF'
+      # DS002: USER root is allowed here; runtime.uid is verified after build.
+      DS002
+      EOF
+    - trivy fs --scanners secret,misconfig --severity HIGH,CRITICAL --exit-code 0 --ignorefile /tmp/source-trivyignore --format json --output reports/source.json --skip-dirs .ci-tools .
     - test -s reports/source.json
     - |
       count=$(grep -c '"RuleID"\|"ID"' reports/source.json || true)
