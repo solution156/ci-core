@@ -240,8 +240,8 @@ def runtime_config(row):
     if not isinstance(raw, dict) or not set(raw) <= {'uid', 'shell', 'require_kasm'}:
         fail('runtime chỉ nhận uid, shell và require_kasm')
     uid, shell, kasm = raw.get('uid', 1000), raw.get('shell', '/bin/bash'), raw.get('require_kasm', True)
-    if type(uid) is not int or not 1 <= uid <= 2147483647:
-        fail('runtime.uid phải là UID non-root')
+    if type(uid) is not int or not 0 <= uid <= 2147483647:
+        fail('runtime.uid phải là UID hợp lệ (0 = root)')
     if shell not in ('/bin/sh', '/bin/bash') or type(kasm) is not bool:
         fail('runtime.shell hoặc runtime.require_kasm không hợp lệ')
     return uid, shell, kasm
@@ -274,20 +274,10 @@ def catalog(strict_locks=True):
         if not dockerfile.is_file() or not dockerfile.is_relative_to(context_dir):
             fail(f'{name}: Dockerfile thiếu hoặc nằm ngoài build context')
         lines = dockerfile.read_text(encoding="utf-8").replace(chr(92) + chr(10), " " ).splitlines()
-        users = [x.strip()[5:].split('#', 1)[0].strip() for x in lines if x.startswith('USER ')]
-        users = [x.split()[0] for x in users if x]
-        uid, _, _ = runtime_config(row)
-        if not any(x.startswith('FROM ') for x in lines) or not users:
-            fail(f'{name}: Dockerfile thiếu FROM hoặc USER cuối')
-        last_user = users[-1]
-        numeric = last_user.split(':', 1)[0]
-        if numeric.isdigit():
-            # `USER 1000`, `USER 1000:1000` — khớp số với runtime.uid.
-            if int(numeric) != uid:
-                fail(f'{name}: USER cuối ({last_user}) không khớp runtime.uid ({uid})')
-        elif last_user.lower() == 'root':
-            fail(f'{name}: Dockerfile không được kết thúc bằng USER root')
-        # Tên user (vd `kasm-user`) được chấp nhận; runtime check xác thực id -u.
+        # Không kiểm tra USER ở catalog: custom image có thể dùng USER root.
+        # Mọi kiểm tra runtime được thực hiện SAU KHI BUILD bởi runtime_check().
+        if not any(x.startswith('FROM ') for x in lines):
+            fail(f'{name}: Dockerfile thiếu FROM')
         stage_names = []
         for line in lines:
             if line.startswith('FROM '):

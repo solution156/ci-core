@@ -115,7 +115,7 @@ GitLab **Settings → CI/CD → Variables**:
 
 ### Nâng cấp consumer đang chạy
 
-Dùng [mẫu consumer](docs/consumer.gitlab-ci.yml) và [runbook rollout](docs/ROLLOUT_VI.md) sau khi có tag engine đã publish trên GitLab đích. Mẫu giữ rule MR trong consumer; engine tự suy ra mode. Catalog có thể khai báo `"runtime": {"uid": 65532, "shell": "/bin/sh", "require_kasm": false}` cho image non-root không dùng Kasm. Các image cũ giữ profile mặc định.
+Dùng [mẫu consumer](docs/consumer.gitlab-ci.yml) và [runbook rollout](docs/ROLLOUT_VI.md) sau khi có tag engine đã publish trên GitLab đích. Mẫu giữ rule MR trong consumer; engine tự suy ra mode. Catalog có thể khai báo `"runtime": {"uid": 0, "shell": "/bin/sh", "require_kasm": false}` cho custom image chạy root, hoặc `"uid": 65532` cho image non-root. Engine **không** kiểm tra `USER` trong Dockerfile lúc validate; mọi kiểm tra user/thư mục được thực hiện **sau khi build** qua `runtime_check` trong catalog.
 
 ### Bước 3: chạy theo luồng
 

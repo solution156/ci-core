@@ -19,7 +19,8 @@ import release
 class Contracts(PipelineTests):
     # Reuse repository fixture but not inherited test methods.
     def test_catalog_accepts_common_user_directive_spellings(self):
-        for spelling in ('USER 1000:1000', 'USER 1000 # comment', 'USER kasm-user'):
+        for spelling in ('USER 1000', 'USER 1000:1000', 'USER 1000 # comment',
+                         'USER root', 'USER kasm-user'):
             with self.subTest(spelling=spelling):
                 dockerfile = Path('images/chrome/Dockerfile')
                 original = dockerfile.read_text()
@@ -418,6 +419,18 @@ class Contracts(PipelineTests):
 def sys_executable():
     import sys
     return sys.executable
+
+
+    def test_runtime_check_supports_root_and_custom_checks(self):
+        data = json.loads(Path('images.json').read_text())
+        row = next(r for r in data['images'] if r['id'] == 'chrome')
+        row['runtime'] = {'uid': 0, 'shell': '/bin/sh', 'require_kasm': False}
+        Path('images.json').write_text(json.dumps(data))
+        with patch.object(pipeline, 'run') as run, patch.object(pipeline.subprocess, 'run'):
+            pipeline.runtime_check(catalog.one('chrome'), 'fixture')
+        command = run.call_args.args[0]
+        self.assertEqual(command[-1], '= 0')
+        self.assertNotIn('/dockerstartup', command[-1])
 
 
 # Avoid rerunning inherited tests twice; keep fixture helpers on a base-only class.

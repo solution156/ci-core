@@ -27,6 +27,7 @@ build (local build → scan → patch nếu cần → gate → runtime → SBOM 
 ```
 
 - `build.json` ghi digest archive ban đầu, `patch.json` ghi digest cuối; Trivy scan archive ngay trên runner. Việc vá dùng image local của job và scan lại kết quả.
+- Runtime check chạy sau build, đọc `images[].runtime` (`uid`, `shell`, `require_kasm`). `uid: 0` = root hợp lệ; Dockerfile có thể dùng `USER root` hoặc tên user bất kỳ. Validate catalog chỉ yêu cầu có `FROM`, không ép `USER`.
 - Skopeo chỉ copy sau khi catalog gate và runtime pass, yêu cầu giữ nguyên digest. `verified.txt` được ghi sau khi đọc lại manifest registry và đối chiếu digest.
 - Cosign ký image và xuất bộ SBOM/provenance của release; BuildKit không đẩy thêm bộ attestation. VEX chỉ xuất khi catalog có nguồn được khai báo.
 - Artifact của mỗi image nằm ở `out/<image-id>/`; `needs:artifacts` cấp trực tiếp. Chỉ evidence/sign/promote giữ bundle tổng hợp có chủ đích.
