@@ -111,6 +111,53 @@ WEAKEST_SECURITY_POLICY = {'severity': {'CRITICAL'}, 'pkg_types': {'os', 'librar
 VEX_FILE = re.compile(r'vex/[a-z0-9]+(?:[._-][a-z0-9]+)*/[A-Za-z0-9][A-Za-z0-9._-]*\.openvex\.json\Z')
 
 
+SOURCE_SCAN_FIELDS = {'misconfig_exceptions'}
+EXCEPTION_FIELDS = {'rule_id', 'justification', 'review_by', 'targets'}
+TRIVY_RULE = re.compile(r'[A-Z]{2,}[0-9]+\Z')
+
+
+def source_scan_exceptions(rows):
+    """Validated, time-bound source-scan exceptions from the consumer catalog."""
+    source = document('images.json')
+    raw = source.get('source_scan') or {}
+    if not isinstance(raw, dict) or not set(raw) <= SOURCE_SCAN_FIELDS:
+        fail('source_scan chỉ nhận misconfig_exceptions')
+    items = raw.get('misconfig_exceptions', [])
+    if not isinstance(items, list):
+        fail('source_scan.misconfig_exceptions phải là mảng')
+    ids = {row['id'] for row in rows}
+    result = []
+    for item in items:
+        if not isinstance(item, dict) or not set(item) <= EXCEPTION_FIELDS:
+            fail('source_scan exception fields không hợp lệ')
+        rule = item.get('rule_id')
+        if not isinstance(rule, str) or not TRIVY_RULE.fullmatch(rule):
+            fail(f'source_scan rule_id không hợp lệ: {rule}')
+        justification = item.get('justification')
+        if not isinstance(justification, str) or len(justification.strip()) < 20:
+            fail(f'{rule}: source_scan exception cần justification (tối thiểu 20 ký tự)')
+        review_by = item.get('review_by')
+        try:
+            review_date = datetime.date.fromisoformat(review_by)
+        except (TypeError, ValueError):
+            fail(f'{rule}: source_scan exception cần review_by dạng YYYY-MM-DD')
+        if review_date < datetime.date.today():
+            fail(f'{rule}: source_scan exception đã quá hạn review')
+        targets = item.get('targets', [])
+        if not isinstance(targets, list) or not targets:
+            fail(f'{rule}: source_scan exception cần targets')
+        for target in targets:
+            if (not isinstance(target, str) or pathlib.PurePosixPath(target).is_absolute()
+                    or '..' in pathlib.PurePosixPath(target).parts or not (ROOT / target).is_file()):
+                fail(f'{rule}: source_scan target không hợp lệ: {target}')
+            owner = pathlib.PurePosixPath(target).parts[1] if len(pathlib.PurePosixPath(target).parts) > 1 else ''
+            if owner not in ids:
+                fail(f'{rule}: target phải nằm trong images.json: {target}')
+        result.append({'rule_id': rule, 'justification': justification.strip(),
+                       'review_by': review_by, 'targets': sorted(targets)})
+    return result
+
+
 def security_gate(row):
     """Validated catalog-owned Trivy gate policy; strict by default."""
     raw = row.get('security_gate') or {}

@@ -32,6 +32,7 @@ build (local build → scan → patch nếu cần → gate → runtime → SBOM 
 - Cosign ký image và xuất bộ SBOM/provenance của release; BuildKit không đẩy thêm bộ attestation. VEX chỉ xuất khi catalog có nguồn được khai báo.
 - Artifact của mỗi image nằm ở `out/<image-id>/`; `needs:artifacts` cấp trực tiếp. Chỉ evidence/sign/promote giữ bundle tổng hợp có chủ đích.
 - Trivy xuất báo cáo đầy đủ; gate Python áp policy catalog và trả lỗi sau khi lưu báo cáo. Gate fail không gọi Skopeo copy.
+- Source scan chỉ bỏ qua misconfig khi có exception khai báo trong `images.json`: `source_scan.misconfig_exceptions[].{rule_id, justification, review_by, targets}`. Mỗi exception cần justification ≥ 20 ký tự, ngày review trong tương lai và target nằm trong catalog. `ci:tools` sinh `out/source-scan/ignore`; rule khác và secret vẫn chặn.
 - Promote chỉ đổi tag trên artifact đã kiểm thử, không rebuild; release tag khác digest đã tồn tại bị từ chối.
 - Release API đọc lại tag/commit sau POST; retry với release khớp đã tồn tại là idempotent.
 - Những thao tác mutable main/RC dùng resource_group; vẫn cần chính sách Harbor immutability cho release tags trên server.

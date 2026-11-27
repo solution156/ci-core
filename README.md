@@ -117,6 +117,8 @@ GitLab **Settings → CI/CD → Variables**:
 
 Dùng [mẫu consumer](docs/consumer.gitlab-ci.yml) và [runbook rollout](docs/ROLLOUT_VI.md) sau khi có tag engine đã publish trên GitLab đích. Mẫu giữ rule MR trong consumer; engine tự suy ra mode. Catalog có thể khai báo `"runtime": {"uid": 0, "shell": "/bin/sh", "require_kasm": false}` cho custom image chạy root, hoặc `"uid": 65532` cho image non-root. Engine **không** kiểm tra `USER` trong Dockerfile lúc validate; mọi kiểm tra user/thư mục được thực hiện **sau khi build** qua `runtime_check` trong catalog.
 
+Exception source scan không nằm trong template: khai báo trong `images.json` với `rule_id`, `justification`, `review_by`, `targets`. Engine validate rồi mới sinh ignore file; hết hạn review thì catalog fail.
+
 ### Bước 3: chạy theo luồng
 
 1. MR → FAST.

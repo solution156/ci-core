@@ -33,6 +33,7 @@ variables:
       test -f .ci-tools/scripts/pipeline.py
       # Do not artifact credentials, credential helper state or repository config.
       python3 -c 'import shutil; shutil.rmtree(".ci-tools/.git")'
+      python3 .ci-tools/scripts/pipeline.py source-scan-policy
   artifacts:
     expire_in: 2 days
-    paths: [.ci-tools/]
+    paths: [.ci-tools/, out/source-scan/ignore]

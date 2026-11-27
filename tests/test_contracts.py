@@ -30,6 +30,34 @@ class Contracts(PipelineTests):
         finally:
             dockerfile.write_text(original)
 
+    def test_source_scan_exceptions_are_validated_and_generated(self):
+        data = json.loads(Path('images.json').read_text())
+        data['source_scan'] = {'misconfig_exceptions': [{
+            'rule_id': 'DS002', 'justification': 'Custom image runs as root by design.',
+            'review_by': '2099-12-31', 'targets': ['images/chrome/Dockerfile']}]}
+        Path('images.json').write_text(json.dumps(data))
+        exceptions = catalog.source_scan_exceptions(catalog.catalog())
+        self.assertEqual(exceptions[0]['rule_id'], 'DS002')
+        import pipeline
+        pipeline.write_source_scan_policy(catalog.catalog())
+        text = Path('out/source-scan/ignore').read_text()
+        self.assertIn('DS002', text)
+        self.assertIn('Custom image runs as root by design.', text)
+        self.assertIn('images/chrome/Dockerfile', text)
+
+    def test_source_scan_exception_rejects_missing_fields_and_expiry(self):
+        base = {'rule_id': 'DS002', 'justification': 'Custom image runs as root by design.',
+                'review_by': '2099-12-31'}
+        for bad, expected in [({**base, 'justification': 'short'}, 'justification'),
+                              ({**base, 'review_by': '2000-01-01'}, 'quá hạn'),
+                              ({**base, 'rule_id': '../bad'}, 'rule_id')]:
+            with self.subTest(bad=bad):
+                data = json.loads(Path('images.json').read_text())
+                data['source_scan'] = {'misconfig_exceptions': [bad]}
+                Path('images.json').write_text(json.dumps(data))
+                with self.assertRaisesRegex(SystemExit, expected):
+                    catalog.source_scan_exceptions(catalog.catalog())
+
     def test_catalog_accepts_common_user_directive_spellings(self):
         for spelling in ('USER 1000', 'USER 1000:1000', 'USER 1000 # comment',
                          'USER root', 'USER kasm-user'):
