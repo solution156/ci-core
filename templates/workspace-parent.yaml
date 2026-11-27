@@ -46,6 +46,10 @@ security:source:
     - |
       count=$(grep -c '"RuleID"\|"ID"' reports/source.json || true)
       echo "SOURCE_FINDINGS=$count"
+      if [ "$count" -gt 0 ]; then
+        echo "SOURCE_FINDING_LINES:"
+        grep -n '"RuleID"\|"ID"\|"Severity"\|"Target"' reports/source.json || true
+      fi
       test "$count" -eq 0
   artifacts:
     when: always
