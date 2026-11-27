@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -36,10 +37,9 @@ class Harbor:
         self.registry = required('HARBOR_REGISTRY')
         self.project = required('HARBOR_PROJECT')
         self.auth = base64.b64encode((required('HARBOR_USER') + ':' + required('HARBOR_PASSWORD')).encode()).decode()
-        scheme = os.environ.get('HARBOR_SCHEME', 'https')
-        if scheme not in ('http', 'https'):
-            fail('Invalid HARBOR_SCHEME')
-        self.base = f'{scheme}://{self.registry}/api/v2.0'
+        if os.environ.get('HARBOR_SCHEME', 'https') != 'https':
+            fail('Harbor API requires HTTPS')
+        self.base = f'https://{self.registry}/api/v2.0'
         if os.environ.get('HARBOR_TLS_VERIFY', 'true').lower() != 'true':
             fail('HARBOR_TLS_VERIFY=false is forbidden for release promotion; install the trusted CA instead')
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
@@ -173,8 +173,32 @@ def gate_policy(row):
     return security_gate(row)
 
 
+def validate_image_report(report):
+    if (not isinstance(report, dict) or report.get('SchemaVersion') != 2
+            or report.get('ArtifactType') != 'container_image'
+            or not isinstance(report.get('ArtifactName'), str) or not report['ArtifactName']
+            or not isinstance(report.get('Metadata'), dict)
+            or not re.fullmatch(r'sha256:[a-f0-9]{64}', str(report['Metadata'].get('ImageID')))
+            or not isinstance(report.get('Results'), list) or not report['Results']):
+        raise ValueError('Incomplete Trivy image report or no supported package inventory')
+    for block in report['Results']:
+        if (not isinstance(block, dict) or block.get('Class') not in PKGS_TO_CLASS.values()
+                or not isinstance(block.get('Target'), str) or not block['Target']
+                or not isinstance(block.get('Vulnerabilities', []), list)):
+            raise ValueError('Invalid Trivy image report result')
+        for finding in block.get('Vulnerabilities', []):
+            if (not isinstance(finding, dict) or not isinstance(finding.get('VulnerabilityID'), str)
+                    or not finding['VulnerabilityID'] or finding.get('Severity') not in
+                    ('UNKNOWN', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL')):
+                raise ValueError('Invalid Trivy image report finding')
+
+
 def report_findings(name, policy):
     checked = document(file(name, 'verify.json'))
+    validate_image_report(checked)
+    patch = document(file(name, 'patch.json'))
+    if checked['Metadata']['ImageID'] != patch.get('config_digest'):
+        raise ValueError('Trivy image report config digest does not match the scanned archive')
     severities = set(policy['severity'].split(','))
     return gate_findings(checked, severities, policy['pkg_types'], policy['ignore_unfixed'])
 
@@ -185,13 +209,24 @@ def check_gate_report(name, policy):
         fail(f'{name} vẫn còn CVE {gated[0]}')
 
 
+def gate_record(name, row, findings):
+    report = file(name, 'verify.json')
+    patch = document(file(name, 'patch.json'))
+    return {'image_id': name, 'policy': security_policy_evidence(row), 'reference': patch['reference'],
+            'report_sha256': hashlib.sha256(report.read_bytes()).hexdigest(),
+            'result': 'fail' if findings else 'pass', 'findings': findings}
+
+
 def gate(_args):
     name = required('IMAGE_ID')
     row = one(name)
     policy = gate_policy(row)
-    gated = report_findings(name, policy)
-    result = {'image_id': name, 'policy': security_policy_evidence(row),
-              'result': 'fail' if gated else 'pass', 'findings': gated}
+    try:
+        gated = report_findings(name, policy)
+        result = gate_record(name, row, gated)
+    except (OSError, ValueError, KeyError) as exc:
+        write(file(name, 'verify-policy.json'), {'image_id': name, 'result': 'error'})
+        return fail(f'Invalid vulnerability gate evidence: {exc}')
     write(file(name, 'verify-policy.json'), result)
     if gated:
         fail(f'{name} vẫn còn CVE {gated[0]}')
@@ -209,8 +244,7 @@ def ensure_verified(name, immutable):
     row = one(name)
     policy = gate_policy(row)
     check_gate_report(name, policy)
-    expected_policy = {'image_id': name, 'policy': security_policy_evidence(row),
-                       'result': 'pass', 'findings': []}
+    expected_policy = gate_record(name, row, [])
     if document(file(name, 'verify-policy.json')) != expected_policy:
         fail('Security gate artifact không khớp images.json hoặc VEX source digest')
     for part in ('scan.json', 'patch.json', 'sbom.cdx.json', 'build.json',

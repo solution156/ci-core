@@ -125,8 +125,10 @@ def source_scan_exceptions(rows):
     items = raw.get('misconfig_exceptions', [])
     if not isinstance(items, list):
         fail('source_scan.misconfig_exceptions phải là mảng')
-    ids = {row['id'] for row in rows}
+    dockerfiles = {(pathlib.PurePosixPath(cfg['context']) / cfg['dockerfile']).as_posix()
+                   for row in rows for cfg in [build_config(row)]}
     result = []
+    seen = set()
     for item in items:
         if not isinstance(item, dict) or not set(item) <= EXCEPTION_FIELDS:
             fail('source_scan exception fields không hợp lệ')
@@ -150,9 +152,11 @@ def source_scan_exceptions(rows):
             if (not isinstance(target, str) or pathlib.PurePosixPath(target).is_absolute()
                     or '..' in pathlib.PurePosixPath(target).parts or not (ROOT / target).is_file()):
                 fail(f'{rule}: source_scan target không hợp lệ: {target}')
-            owner = pathlib.PurePosixPath(target).parts[1] if len(pathlib.PurePosixPath(target).parts) > 1 else ''
-            if owner not in ids:
-                fail(f'{rule}: target phải nằm trong images.json: {target}')
+            if target not in dockerfiles or not (ROOT / target).resolve().is_relative_to(ROOT.resolve()):
+                fail(f'{rule}: target phải là Dockerfile khai báo trong images.json: {target}')
+            if (rule, target) in seen:
+                fail(f'{rule}: trùng source scan exception cho {target}')
+            seen.add((rule, target))
         result.append({'rule_id': rule, 'justification': justification.strip(),
                        'review_by': review_by, 'targets': sorted(targets)})
     return result

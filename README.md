@@ -109,6 +109,7 @@ GitLab **Settings → CI/CD → Variables**:
 | `HARBOR_REGISTRY` / `HARBOR_PROJECT` | Luôn | Nơi push image. |
 | `HARBOR_USER` / `HARBOR_PASSWORD` | FULL/RELEASE | Robot push, đặt **Protected**. |
 | `COSIGN_PRIVATE_KEY` / `COSIGN_PASSWORD` | Sign/RELEASE | Khóa ký, không đưa vào chat/log. |
+| `COSIGN_PUBLIC_KEY` | FULL/RELEASE | GitLab File variable trên protected refs; public key được cấp độc lập từ chính sách tin cậy. |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | Môi trường cần proxy | Chỉ qua biến. |
 | `IMAGE_SELECTION` | Run pipeline thủ công | FAST có thể chọn ID; protected `main` chỉ nhận `auto` hoặc `all` (toàn bộ image enabled). |
 | `BUILDX_BUILDER_NETWORK` | Thử network khác | Mặc định để trống. |
@@ -117,7 +118,9 @@ GitLab **Settings → CI/CD → Variables**:
 
 Dùng [mẫu consumer](docs/consumer.gitlab-ci.yml) và [runbook rollout](docs/ROLLOUT_VI.md) sau khi có tag engine đã publish trên GitLab đích. Mẫu giữ rule MR trong consumer; engine tự suy ra mode. Catalog có thể khai báo `"runtime": {"uid": 0, "shell": "/bin/sh", "require_kasm": false}` cho custom image chạy root, hoặc `"uid": 65532` cho image non-root. Engine **không** kiểm tra `USER` trong Dockerfile lúc validate; mọi kiểm tra user/thư mục được thực hiện **sau khi build** qua `runtime_check` trong catalog.
 
-Exception source scan không nằm trong template: khai báo trong `images.json` với `rule_id`, `justification`, `review_by`, `targets`. Engine validate rồi mới sinh ignore file; hết hạn review thì catalog fail.
+Exception source scan khai báo trong `images.json` với `rule_id`, `justification`, `review_by`, `targets`. Gate chỉ áp dụng cho đúng cặp rule/Dockerfile và chỉ đối với misconfiguration. Xem quyết định đã lọc nội dung secret tại `reports/source-policy.json`. Ngoại lệ hết hạn làm job fail.
+
+- [Nghiệm thu production và bàn giao image](docs/PRODUCTION_HANDOFF_VI.md)
 
 ### Bước 3: chạy theo luồng
 

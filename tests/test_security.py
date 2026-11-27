@@ -137,8 +137,11 @@ class SecurityTests(fixtures.PipelineTests):
     def test_gate_job_ignores_ambient_weakening_variables(self):
         os.environ.update(IMAGE_ID='chrome', GATE_PKG_TYPES='os', GATE_IGNORE_UNFIXED='true',
                           TRIVY_GATE_SEVERITY='LOW')
-        catalog.write('out/chrome/verify.json', {'Results': [{
-            'Class': 'lang-pkgs', 'Vulnerabilities': [
+        config_digest = 'sha256:' + 'a' * 64
+        catalog.write('out/chrome/patch.json', {'config_digest': config_digest, 'reference': 'fixture@' + config_digest})
+        catalog.write('out/chrome/verify.json', {'SchemaVersion': 2, 'ArtifactType': 'container_image',
+            'ArtifactName': 'image.tar', 'Metadata': {'ImageID': config_digest}, 'Results': [{
+            'Class': 'lang-pkgs', 'Target': 'package.lock', 'Vulnerabilities': [
                 {'VulnerabilityID': 'CVE-LIB-UNFIXED', 'Severity': 'CRITICAL'}]}]})
         with self.assertRaisesRegex(SystemExit, 'CVE-LIB-UNFIXED'):
             harbor.gate(None)
@@ -180,13 +183,19 @@ class SecurityTests(fixtures.PipelineTests):
         Path('out/chrome/verified.txt').write_text(immutable + '\n')
         initial = base.rsplit(':', 1)[0] + '@sha256:' + 'a' * 64
         catalog.write('out/chrome/build.json', {'candidate': base, 'reference': initial})
-        catalog.write('out/chrome/patch.json', {'candidate': base, 'status': 'patched', 'reference': immutable})
+        config_digest = 'sha256:' + 'c' * 64
+        catalog.write('out/chrome/patch.json', {'candidate': base, 'status': 'patched', 'reference': immutable,
+                                              'config_digest': config_digest})
         catalog.write('out/chrome/runtime.json', {'reference': immutable, 'result': 'pass'})
-        for part in ('scan.json', 'verify.json', 'sbom.cdx.json'):
+        for part in ('scan.json', 'sbom.cdx.json'):
             catalog.write('out/chrome/' + part, {})
         policy = catalog.security_policy_evidence(catalog.one('chrome'))
-        catalog.write('out/chrome/verify-policy.json', {
-            'image_id': 'chrome', 'policy': policy, 'result': 'pass', 'findings': []})
+        catalog.write('out/chrome/verify.json', {'SchemaVersion': 2, 'ArtifactType': 'container_image',
+            'ArtifactName': 'image.tar', 'Metadata': {'ImageID': config_digest},
+            'Results': [{'Class': 'os-pkgs', 'Target': 'alpine'}]})
+        catalog.write('out/chrome/verify-policy.json', harbor.gate_record('chrome', catalog.one('chrome'), []))
+        Path('.ci-tools').mkdir(exist_ok=True)
+        Path('.ci-tools/engine-commit.txt').write_text('e' * 40)
         release.evidence(None)
         evidence = catalog.document('out/chrome/evidence.json')
         self.assertEqual(evidence['gate_policy'], policy)

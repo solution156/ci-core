@@ -39,25 +39,14 @@ security:source:
   needs:
     - job: ci:tools
       artifacts: true
+  before_script:
+    - command -v python3 >/dev/null || apk add --no-cache python3
   script:
-    - mkdir -p reports
-    # Exceptions come only from validated images.json (rule, justification,
-    # review date, scoped targets). Every other finding still fails the job.
-    - test -f out/source-scan/ignore
-    - trivy fs --scanners secret,misconfig --severity HIGH,CRITICAL --exit-code 0 --ignorefile out/source-scan/ignore --format json --output reports/source.json --skip-dirs .ci-tools .
-    - test -s reports/source.json
-    - |
-      count=$(grep -c '"RuleID"\|"ID"' reports/source.json || true)
-      echo "SOURCE_FINDINGS=$count"
-      if [ "$count" -gt 0 ]; then
-        echo "SOURCE_FINDING_LINES:"
-        grep -n '"RuleID"\|"ID"\|"Severity"\|"Target"' reports/source.json || true
-      fi
-      test "$count" -eq 0
+    - python3 .ci-tools/scripts/source_gate.py
   artifacts:
     when: always
     expire_in: 7 days
-    paths: [reports/source.json]
+    paths: [reports/source-policy.json]
 
 prepare:plan:
   stage: plan
@@ -75,6 +64,7 @@ prepare:plan:
       if [ "$mode" != fast ]; then
         : "${IMAGE_GATE_TOOLS_IMAGE:?Set IMAGE_GATE_TOOLS_IMAGE to the pinned build-gate tool image}"
         : "${COSIGN_IMAGE:?Set COSIGN_IMAGE to a pinned shell-capable image}"
+        : "${COSIGN_PUBLIC_KEY:?Set COSIGN_PUBLIC_KEY to the trusted public key file variable}"
         if [ "${DEVGUARD_ENABLED:-false}" = true ]; then
           : "${DEVGUARD_SCANNER_IMAGE:?Set DEVGUARD_SCANNER_IMAGE when enabling DevGuard}"
         fi

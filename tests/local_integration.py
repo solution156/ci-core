@@ -41,12 +41,12 @@ def main():
     started = False
     work = output / ('fixture-' + runid)
     work.mkdir()
-    def run(step, cmd, *, cwd=None, extra=None):
+    def run(step, cmd, *, cwd=None, extra=None, expected=0):
         result = subprocess.run(cmd, cwd=cwd, env={**env, **(extra or {})}, capture_output=True, text=True, timeout=900)
         (output / (step + '.log')).write_text(result.stdout + result.stderr)
         report['steps'].append({'name': step, 'exit_code': result.returncode})
-        print(step, 'PASS' if result.returncode == 0 else 'FAIL', flush=True)
-        if result.returncode:
+        print(step, 'PASS' if result.returncode == expected else 'FAIL', flush=True)
+        if result.returncode != expected:
             raise RuntimeError(step + ' failed; see ' + str(output / (step + '.log')))
         return result.stdout.strip()
     try:
@@ -71,6 +71,8 @@ USER 1000
         (work / '.dockerignore').write_text('.docker-job\nout\n')
         (work / 'images.json').write_text(json.dumps({'schema_version': 2, 'images': [{'id': 'fixture', 'repository': 'fixture', 'build': {'context': 'images/fixture', 'dockerfile': 'Dockerfile', 'platform': 'linux/amd64'}, 'enabled': True, 'version': '0.1.0', 'depends_on': []}]}))
         sha = 'a' * 40
+        (work / '.ci-tools').mkdir()
+        (work / '.ci-tools/engine-commit.txt').write_text(sha + '\n')
         env.update(CI_JOB_ID=runid, CI_PROJECT_DIR=str(work), DOCKER_CONFIG=str(work / '.docker-job'),
                    BUILDX_BUILDER_NETWORK='host')
         env.update(IMAGE_ID='fixture', IMAGE_CANDIDATE_TAG='ci-local-' + runid,
@@ -107,6 +109,28 @@ USER 1000
             ]) + ' "$@"\n')
             wrapper.chmod(0o700)
         env.update(PATH=str(bindir) + ':' + env['PATH'], TMPDIR=str(tmp))
+        run('source-gate', [sys.executable, str(CORE / 'scripts/source_gate.py')], cwd=work)
+        dockerfile = folder / 'Dockerfile'
+        original = dockerfile.read_text()
+        dockerfile.write_text(original.replace('USER 1000', 'USER root'))
+        catalog_path = work / 'images.json'
+        config = json.loads(catalog_path.read_text())
+        config['source_scan'] = {'misconfig_exceptions': [{
+            'rule_id': 'DS002', 'targets': ['images/fixture/Dockerfile'],
+            'justification': 'Disposable fixture for exact exception scope.', 'review_by': '2099-12-31',
+        }]}
+        catalog_path.write_text(json.dumps(config))
+        other = work / 'Dockerfile'
+        other.write_text('FROM alpine:3.21\nUSER root\n')
+        gate_command = [sys.executable, str(CORE / 'scripts/source_gate.py')]
+        run('source-gate-blocks-same-rule-outside-scope', gate_command, cwd=work, expected=1)
+        decision = json.loads((work / 'reports/source-policy.json').read_text())
+        if ([(r['rule_id'], r['target']) for r in decision['blocking']] != [('DS002', 'Dockerfile')]
+                or len(decision['exceptions_applied']) != 1):
+            raise RuntimeError('Source gate did not enforce exact exception scope')
+        other.unlink()
+        run('source-gate-accepts-only-approved-target', gate_command, cwd=work)
+        dockerfile.write_text(original)
         run('build-gate-and-copy', [sys.executable, str(CORE / 'scripts/build_gate.py')], cwd=work)
         artifacts = work / 'out/fixture'
         immutable = (artifacts / 'verified.txt').read_text().strip()
@@ -126,12 +150,21 @@ USER 1000
         keyenv = {'COSIGN_PASSWORD': password}
         run('cosign-keygen', [*cosign, 'generate-key-pair', '--output-key-prefix=/keys/cosign'], extra=keyenv)
         run('cosign-sign', [*cosign, 'sign', '--yes', '--key', '/keys/cosign.key', '--tlog-upload=false', '--allow-insecure-registry', immutable], extra=keyenv)
-        run('cosign-public-key', [*cosign, 'public-key', '--key', '/keys/cosign.key', '--outfile', '/keys/verify.pub'], extra=keyenv)
-        run('cosign-verify', [*cosign, 'verify', '--key', '/keys/verify.pub', '--insecure-ignore-tlog', '--allow-insecure-registry', immutable], extra=keyenv)
+        run('cosign-verify', [*cosign, 'verify', '--key', '/keys/cosign.pub', '--insecure-ignore-tlog', '--allow-insecure-registry', immutable])
         for kind, filename in [('cyclonedx', 'sbom.cdx.json'), ('slsaprovenance1', 'provenance.json')]:
             run('attest-' + kind, [*cosign, 'attest', '--yes', '--key', '/keys/cosign.key', '--tlog-upload=false', '--allow-insecure-registry', '--type', kind, '--predicate', '/evidence/' + filename, immutable], extra=keyenv)
-            run('verify-' + kind, [*cosign, 'verify-attestation', '--key', '/keys/verify.pub', '--insecure-ignore-tlog', '--allow-insecure-registry', '--type', kind, immutable], extra=keyenv)
+            run('verify-' + kind, [*cosign, 'verify-attestation', '--key', '/keys/cosign.pub', '--insecure-ignore-tlog', '--allow-insecure-registry', '--type', kind, immutable])
         (keys / 'cosign.key').unlink(missing_ok=True)
+        # Adapt the client to the disposable loopback registry only.
+        client = bindir / 'cosign'
+        client.write_text('#!/bin/sh\ncommand="$1"; shift\nexec ' + shlex.join(cosign)
+                          + ' "$command" --allow-insecure-registry "$@"\n')
+        client.chmod(0o700)
+        verify = [sys.executable, str(CORE / 'scripts/verify_release.py'), immutable,
+                  '--repository', immutable.split('@')[0], '--source', work.as_uri(),
+                  '--key', '/keys/cosign.pub', '--engine-commit', sha, '--allow-no-transparency-log']
+        run('deployment-verifier', [*verify, '--commit', sha], cwd=work)
+        run('deployment-verifier-rejects-wrong-source-commit', [*verify, '--commit', 'b' * 40], cwd=work, expected=1)
         report['status'] = 'pass'
     except Exception as exc:
         report['status'] = 'fail'

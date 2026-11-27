@@ -97,11 +97,13 @@ ci:tools:
       test "$CI_COMMIT_REF_PROTECTED" = true
       : "${COSIGN_PRIVATE_KEY:?Missing protected COSIGN_PRIVATE_KEY}"
       : "${COSIGN_PASSWORD:?Missing protected COSIGN_PASSWORD}"
+      : "${COSIGN_PUBLIC_KEY:?Missing trusted COSIGN_PUBLIC_KEY file variable}"
+      test -s "$COSIGN_PUBLIC_KEY"
       : "${HARBOR_USER:?Missing protected HARBOR_USER}"
       : "${HARBOR_PASSWORD:?Missing protected HARBOR_PASSWORD}"
       umask 077
       mkdir -p "$DOCKER_CONFIG"
-      trap 'rm -f "$DOCKER_CONFIG/config.json" "$DOCKER_CONFIG/cosign-verify.pub"; rmdir "$DOCKER_CONFIG" 2>/dev/null || true' EXIT
+      trap 'rm -f "$DOCKER_CONFIG/config.json"; rmdir "$DOCKER_CONFIG" 2>/dev/null || true' EXIT
       if [ -n "${DOCKER_AUTH_CONFIG:-}" ]; then
         printf '%s' "$DOCKER_AUTH_CONFIG" > "$DOCKER_CONFIG/config.json"
       else
@@ -117,15 +119,13 @@ ci:tools:
       if [ -f "out/$IMAGE_ID/vex.openvex.json" ]; then
         cosign attest --yes --key "$key" --tlog-upload=false --type openvex --predicate "out/$IMAGE_ID/vex.openvex.json" "$ref"
       fi
-      # Read the signature back from the registry. This uses the signing keypair;
-      # it is not an independent trust policy for the deployment environment.
-      cosign public-key --key "$key" --outfile "$DOCKER_CONFIG/cosign-verify.pub"
-      cosign verify --key "$DOCKER_CONFIG/cosign-verify.pub" --insecure-ignore-tlog "$ref" >/dev/null
+      # The expected public key is provisioned independently of this job.
+      cosign verify --key "$COSIGN_PUBLIC_KEY" --insecure-ignore-tlog "$ref" >/dev/null
       for predicate in cyclonedx slsaprovenance1; do
-        cosign verify-attestation --key "$DOCKER_CONFIG/cosign-verify.pub" --insecure-ignore-tlog --type "$predicate" "$ref" >/dev/null
+        cosign verify-attestation --key "$COSIGN_PUBLIC_KEY" --insecure-ignore-tlog --type "$predicate" "$ref" >/dev/null
       done
       if [ -f "out/$IMAGE_ID/vex.openvex.json" ]; then
-        cosign verify-attestation --key "$DOCKER_CONFIG/cosign-verify.pub" --insecure-ignore-tlog --type openvex "$ref" >/dev/null
+        cosign verify-attestation --key "$COSIGN_PUBLIC_KEY" --insecure-ignore-tlog --type openvex "$ref" >/dev/null
       fi
       printf '%s\n' "$ref" > "out/$IMAGE_ID/signed.txt"
   artifacts:

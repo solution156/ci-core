@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 import urllib.parse
 from catalog import one, env, require, ref, document, write, fail, security_policy_evidence, runtime_config
+from harbor import gate_record, report_findings
 
 
 def file(name, part):
@@ -40,13 +41,16 @@ def evidence(_args):
             fail(f'Thiếu evidence: {part}')
         document(file(name, part))
     gate_policy = security_policy_evidence(row)
-    expected_gate = {'image_id': name, 'policy': gate_policy, 'result': 'pass', 'findings': []}
-    if document(file(name, 'verify-policy.json')) != expected_gate:
+    expected_gate = gate_record(name, row, [])
+    if report_findings(name, gate_policy) or document(file(name, 'verify-policy.json')) != expected_gate:
         fail('Security gate result không khớp catalog hoặc VEX source digest')
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     core_source = require('CI_PROJECT_URL')
     commit = require('CI_COMMIT_SHA')
     root_id = require('ROOT_PIPELINE_ID')
+    engine_commit = pathlib.Path('.ci-tools/engine-commit.txt').read_text().strip()
+    if not re.fullmatch(r'[a-f0-9]{40}', engine_commit):
+        fail('Invalid resolved engine SHA')
     manifest = {
         'image_id': name, 'image_version': row['version'], 'reference': immutable,
         'build_reference': initial, 'patch_status': patch['status'],
@@ -55,7 +59,7 @@ def evidence(_args):
         'pipeline_kind': require('WORKSPACE_REF_KIND'), 'generated_at': now,
         'scan_severity': require('TRIVY_SCAN_SEVERITY'),
         'gate_severity': gate_policy['severity'],
-        'gate_policy': gate_policy,
+        'gate_policy': gate_policy, 'engine_commit': engine_commit, 'vulnerability_gate': expected_gate,
     }
     write(file(name, 'evidence.json'), manifest)
     # SLSA v1 predicate, Cosign ghép predicate vào in-toto statement với subject digest.
@@ -69,7 +73,8 @@ def evidence(_args):
                 'platform': build.get('platform'), 'target': build.get('target'),
                 'buildArgs': build.get('build_args', {}), 'candidate': candidate,
             },
-            'internalParameters': {'rootPipelineId': root_id, 'patchStatus': patch['status']},
+            'internalParameters': {'rootPipelineId': root_id, 'patchStatus': patch['status'],
+                                   'engineCommit': engine_commit, 'vulnerabilityGate': expected_gate},
             'resolvedDependencies': [{'uri': 'git+' + core_source,
                                       'digest': {'gitCommit': commit}}],
         },

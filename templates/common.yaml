@@ -32,8 +32,8 @@ variables:
         "$CI_SERVER_URL/$CI_CORE_PROJECT.git" .ci-tools
       test -f .ci-tools/scripts/pipeline.py
       # Do not artifact credentials, credential helper state or repository config.
+      git -C .ci-tools rev-parse HEAD > .ci-tools/engine-commit.txt
       python3 -c 'import shutil; shutil.rmtree(".ci-tools/.git")'
-      python3 .ci-tools/scripts/pipeline.py source-scan-policy
   artifacts:
     expire_in: 2 days
-    paths: [.ci-tools/, out/source-scan/ignore]
+    paths: [.ci-tools/]

@@ -11,10 +11,9 @@ import subprocess
 import tempfile
 from catalog import (catalog, one, ref, run, env, require, document, write, fail,
                      checked_path, docker_config_path, job_builder_name, lock_config, build_config,
-                     security_gate, pipeline_mode, runtime_config,
-                     source_scan_exceptions)
+                     security_gate, pipeline_mode, runtime_config)
 
-BASE_POLICIES = ('validate', 'gate-policy', 'source-scan-policy')
+BASE_POLICIES = ('validate', 'gate-policy')
 
 PROXIES = ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy')
 
@@ -78,20 +77,6 @@ def write_gate_policies(_args):
         (destination / f'{row["id"]}.sh').write_text(script, encoding='utf-8')
     print('Generated catalog-owned gate policy files for enabled images.')
 
-
-def write_source_scan_policy(_args):
-    """Emit a Trivy ignore file from validated, time-bound catalog exceptions."""
-    rows = catalog(strict_locks=pipeline_mode() != 'fast')
-    lines = ['# Generated from images.json source_scan.misconfig_exceptions.',
-             '# Each exception has justification, review_by and scoped targets.']
-    for item in source_scan_exceptions(rows):
-        lines += [f'# {item["rule_id"]}: {item["justification"]} '
-                  f'(review_by={item["review_by"]}, targets={item["targets"]})',
-                  item['rule_id']]
-    destination = pathlib.Path('out/source-scan')
-    destination.mkdir(parents=True, exist_ok=True)
-    (destination / 'ignore').write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    print('Generated catalog-owned source-scan ignore file.')
 
 
 def validate(_):
@@ -291,7 +276,7 @@ def runtime(_args):
 
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument('command', choices=('validate', 'gate-policy', 'source-scan-policy',
+    cli.add_argument('command', choices=('validate', 'gate-policy',
                                          'smoke', 'build', 'patch', 'runtime'))
     cli.add_argument('--dry-run', action='store_true', help='Show intent only; no Docker/network/file mutations')
     args = cli.parse_args()
@@ -300,7 +285,6 @@ def main():
         return
     try:
         {'validate': validate, 'gate-policy': write_gate_policies,
-         'source-scan-policy': write_source_scan_policy,
          'smoke': build, 'build': build, 'patch': patch, 'runtime': runtime}[args.command](args)
     except (OSError, ValueError, KeyError) as exc:
         fail(str(exc))

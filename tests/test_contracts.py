@@ -38,12 +38,23 @@ class Contracts(PipelineTests):
         Path('images.json').write_text(json.dumps(data))
         exceptions = catalog.source_scan_exceptions(catalog.catalog())
         self.assertEqual(exceptions[0]['rule_id'], 'DS002')
-        import pipeline
-        pipeline.write_source_scan_policy(catalog.catalog())
-        text = Path('out/source-scan/ignore').read_text()
-        self.assertIn('DS002', text)
-        self.assertIn('Custom image runs as root by design.', text)
-        self.assertIn('images/chrome/Dockerfile', text)
+        import source_gate
+        finding = {'ID': 'DS002', 'Severity': 'HIGH', 'Status': 'FAIL'}
+        report = {'SchemaVersion': 2, 'ArtifactType': 'filesystem', 'ArtifactName': '.', 'Results': [
+            {'Target': 'images/chrome/Dockerfile', 'Class': 'config', 'Type': 'dockerfile',
+             'Misconfigurations': [finding]},
+            {'Target': 'images/firefox/Dockerfile', 'Class': 'config', 'Type': 'dockerfile',
+             'Misconfigurations': [finding, {**finding, 'ID': 'DS026'}]},
+            {'Target': 'notes.txt', 'Class': 'secret', 'Secrets': [
+                {'RuleID': 'DS002', 'Severity': 'HIGH', 'Match': 'never-record-this'}]},
+        ]}
+        decision = source_gate.evaluate(report, exceptions, {'images/chrome/Dockerfile', 'images/firefox/Dockerfile'})
+        self.assertEqual(len(decision['exceptions_applied']), 1)
+        self.assertEqual([f['target'] for f in decision['blocking']],
+                         ['images/firefox/Dockerfile', 'images/firefox/Dockerfile', 'notes.txt'])
+        self.assertNotIn('never-record-this', json.dumps(decision))
+        with self.assertRaisesRegex(ValueError, 'coverage'):
+            source_gate.evaluate({**report, 'Results': []}, exceptions, {'images/chrome/Dockerfile'})
 
     def test_source_scan_exception_rejects_missing_fields_and_expiry(self):
         base = {'rule_id': 'DS002', 'justification': 'Custom image runs as root by design.',
@@ -88,13 +99,16 @@ class Contracts(PipelineTests):
         os.environ.update(IMAGE_ID='chrome', IMAGE_CANDIDATE_TAG='ci-test',
                           TRIVY_SCAN_SEVERITY='HIGH,CRITICAL')
         def reports(archive, output, flags):
-            report = {'Results': []}
+            report: dict = {'Results': []}
             if output.name == 'verify.json':
-                report['Results'] = [{'Class': 'lang-pkgs', 'Vulnerabilities': [
+                report.update(SchemaVersion=2, ArtifactType='container_image', ArtifactName='image.tar',
+                              Metadata={'ImageID': 'sha256:' + 'b' * 64})
+                report['Results'] = [{'Class': 'lang-pkgs', 'Target': 'package.lock', 'Vulnerabilities': [
                     {'Severity': 'CRITICAL', 'VulnerabilityID': 'CVE-fixture'}]}]
             catalog.write(output, report)
         with patch.object(pipeline, 'build', return_value={'args': {}}), \
-             patch.object(build_gate, 'save_archive', return_value=('docker-archive:fixture', 'sha256:' + 'a' * 64, 'runtime-id')), \
+             patch.object(build_gate, 'save_archive', return_value=(
+                 'docker-archive:fixture', 'sha256:' + 'a' * 64, 'runtime-id', 'sha256:' + 'b' * 64)), \
              patch.object(build_gate, 'trivy', side_effect=reports), \
              patch.object(build_gate, 'copy_verified') as copy, \
              patch.object(build_gate.subprocess, 'run'):
@@ -103,6 +117,19 @@ class Contracts(PipelineTests):
             copy.assert_not_called()
         self.assertEqual(catalog.document('out/chrome/verify-policy.json')['result'], 'fail')
         self.assertFalse(Path('out/chrome/verified.txt').exists())
+
+    def test_incomplete_image_report_never_passes(self):
+        for report in ({}, {'SchemaVersion': 2, 'ArtifactType': 'container_image', 'Results': []}):
+            with self.subTest(report=report), self.assertRaisesRegex(ValueError, 'report'):
+                harbor.validate_image_report(report)
+
+    def test_scanner_environment_allows_mirrors_not_policy_overrides(self):
+        from scanner_env import scanner_env
+        with patch.dict(os.environ, {'TRIVY_SKIP_DIRS': '.', 'TRIVY_IGNORE_STATUS': 'affected',
+                                     'TRIVY_VEX': 'repo', 'TRIVY_DB_REPOSITORY': 'mirror.example.test/db'}):
+            effective = scanner_env()
+        self.assertEqual(effective['TRIVY_DB_REPOSITORY'], 'mirror.example.test/db')
+        self.assertFalse({'TRIVY_SKIP_DIRS', 'TRIVY_IGNORE_STATUS', 'TRIVY_VEX'} & effective.keys())
 
     def test_effective_dag_stages_and_artifact_contracts(self):
         self.full()

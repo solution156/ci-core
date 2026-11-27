@@ -14,6 +14,7 @@ import tempfile
 import harbor
 import pipeline
 from catalog import document, env, fail, one, pipeline_mode, ref, require, run, security_gate, write
+from scanner_env import scanner_env
 
 
 def manifest(transport, authfile=None):
@@ -43,12 +44,15 @@ def save_archive(local_image, archive):
         config_file = bundle.extractfile(images[0]['Config'])
         if config_file is None or config.get('config', {}).get('digest') != 'sha256:' + hashlib.sha256(config_file.read()).hexdigest():
             fail('Archive config digest không khớp manifest')
-    return transport, digest, image_id
+    return transport, digest, image_id, config['config']['digest']
 
 
 def trivy(archive, output, flags):
-    run(['trivy', 'image', '--input', str(archive), *flags, '--output', str(output)])
-    document(output)
+    subprocess.run(['trivy', '--config', '/dev/null', 'image', '--ignore-policy=', '--input',
+                    str(archive), *flags, '--output', str(output)], check=True, env=scanner_env())
+    report = document(output)
+    if output.name == 'verify.json' and (not isinstance(report, dict) or report.get('ArtifactName') != str(archive)):
+        fail('Trivy report is not for the final archive')
 
 
 def patch_local(local_image, patched_image, packages, user, arch, directory):
@@ -96,7 +100,7 @@ def main():
         # Archives live outside the checkout and are never GitLab artifacts.
         with tempfile.TemporaryDirectory(prefix='ci-image-') as directory:
             archive = pathlib.Path(directory, 'image.tar')
-            transport, original_digest, runtime_image = save_archive(local_image, archive)
+            transport, original_digest, runtime_image, config_digest = save_archive(local_image, archive)
             initial = repository + '@' + original_digest
             write(p('build.json'), {
                 'id': name, 'version': row['version'], 'candidate': candidate,
@@ -115,7 +119,7 @@ def main():
                 patch_dir.mkdir()
                 patch_local(local_image, patched, packages, user, build['platform'], str(patch_dir))
                 archive.unlink()
-                transport, final_digest, runtime_image = save_archive(patched, archive)
+                transport, final_digest, runtime_image, config_digest = save_archive(patched, archive)
                 status = 'patched'
             elif packages:
                 status = 'patch-disabled'
@@ -124,7 +128,7 @@ def main():
                                     'build_reference': initial, 'status': status, 'reference': immutable,
                                     'available_packages': packages, 'excluded_packages': excluded,
                                     'requested_packages': packages if status == 'patched' else [],
-                                    'transport': 'local-archive'})
+                                    'config_digest': config_digest, 'transport': 'local-archive'})
             flags = ['--scanners', 'vuln', '--pkg-types', 'os,library', '--ignore-unfixed=false',
                      '--ignorefile', '/dev/null', '--exit-code', '0', '--format', 'json']
             for vex in policy['vex_sources']:
