@@ -151,8 +151,10 @@ class PipelineTests(unittest.TestCase):
 
     def test_runtime_check_points_to_generated_lock_with_docker_run_env(self):
         import pipeline
-        data = json.loads(Path('images.json').read_text())
-        row = next(r for r in data['images'] if r['id'] == 'vscode')
+        # Self-contained: do not depend on a sibling consumer checkout being present.
+        script = Path('runtime-check-fixture.sh')
+        script.write_text('#!/bin/sh\ntrue\n')
+        row = {'id': 'vscode', 'runtime_check': script.name}
         runs = []
         def record(cmd, capture=False, **kwargs):
             runs.append(cmd)
