@@ -18,6 +18,18 @@ import release
 
 class Contracts(PipelineTests):
     # Reuse repository fixture but not inherited test methods.
+    def test_catalog_allows_generated_copy_sources_but_rejects_traversal(self):
+        dockerfile = Path('images/chrome/Dockerfile')
+        original = dockerfile.read_text()
+        try:
+            dockerfile.write_text(original + '\nCOPY ./certs/CICD_Root.crt /etc/ssl/certs/\n')
+            catalog.catalog()
+            dockerfile.write_text(original + '\nCOPY ../outside.crt /etc/ssl/\n')
+            with self.assertRaisesRegex(SystemExit, 'không an toàn'):
+                catalog.catalog()
+        finally:
+            dockerfile.write_text(original)
+
     def test_catalog_accepts_common_user_directive_spellings(self):
         for spelling in ('USER 1000', 'USER 1000:1000', 'USER 1000 # comment',
                          'USER root', 'USER kasm-user'):

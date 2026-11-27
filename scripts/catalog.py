@@ -300,8 +300,13 @@ def catalog(strict_locks=True):
                 fail(f'{name}: COPY không hợp lệ: {line}')
             for item in src:
                 p = context_dir / item
-                if pathlib.PurePosixPath(item).is_absolute() or '..' in pathlib.PurePosixPath(item).parts or not p.exists() or not p.resolve().is_relative_to(context_dir):
-                    fail(f'{name}: nguồn COPY không an toàn/không tồn tại: {item}')
+                if pathlib.PurePosixPath(item).is_absolute() or '..' in pathlib.PurePosixPath(item).parts:
+                    fail(f'{name}: nguồn COPY không an toàn: {item}')
+                # File có thể do CI tạo trước build (cert local, file từ secret).
+                # Kiểm tra tồn tại để biết sớm, nhưng KHÔNG chặn: build sẽ fail
+                # nếu file thực sự cần thiết không xuất hiện.
+                if p.exists() and not p.resolve().is_relative_to(context_dir):
+                    fail(f'{name}: nguồn COPY vượt build context: {item}')
         deps = row.get('depends_on')
         if not isinstance(deps, list) or any(not isinstance(d, str) or not d.startswith('shared/') or '..' in pathlib.PurePosixPath(d).parts or not (ROOT / d).is_file() for d in deps):
             fail(f'{name}: depends_on phải tham chiếu tài nguyên shared/ hợp lệ')

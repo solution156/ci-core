@@ -39,11 +39,14 @@ security:source:
   needs: []
   script:
     - mkdir -p reports
-    # Scan with exit-code 0 so the diagnostic below always runs. The Python
-    # check reproduces the strict gate: any HIGH/CRITICAL finding fails the job.
+    # JSON report for triage; gate decoded with grep, available in the Trivy
+    # image (it has no python3/jq). Any HIGH/CRITICAL finding still fails.
     - trivy fs --scanners secret,misconfig --severity HIGH,CRITICAL --exit-code 0 --format json --output reports/source.json --skip-dirs .ci-tools .
     - test -s reports/source.json
-    - python3 -c 'import json,sys; d=json.load(open("reports/source.json")); rows=[(r.get("Target"),k,v.get("RuleID") or v.get("ID"),v.get("Severity")) for r in d.get("Results",[]) for k in ("Misconfigurations","Secrets") for v in (r.get(k) or [])]; print("SOURCE_FINDINGS:",rows or "none"); sys.exit(1 if rows else 0)'
+    - |
+      count=$(grep -c '"RuleID"\|"ID"' reports/source.json || true)
+      echo "SOURCE_FINDINGS=$count"
+      test "$count" -eq 0
   artifacts:
     when: always
     expire_in: 7 days
